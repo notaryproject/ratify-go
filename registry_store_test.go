@@ -243,6 +243,12 @@ func TestRegistryStore_ListReferrers(t *testing.T) {
 			case "/v2/test/manifests/v2":
 				w.WriteHeader(http.StatusNotFound)
 				return
+			default:
+				// Handle cosign signature requests (*.sig tags)
+				if strings.HasSuffix(r.URL.Path, ".sig") {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
 			}
 		}
 
@@ -297,7 +303,8 @@ func TestRegistryStore_ListReferrers(t *testing.T) {
 	}
 	repoName := uri.Host + "/test"
 	store := NewRegistryStore(RegistryStoreOptions{
-		PlainHTTP: true,
+		PlainHTTP:      true,
+		AllowCosignTag: true,
 	})
 	ctx := context.Background()
 
@@ -587,4 +594,300 @@ func TestRegistryStore_FetchManifest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRegistryStore_AllowCosignTag(t *testing.T) {
+	t.Run("cosign signature disabled by default", func(t *testing.T) {
+		store := NewRegistryStore(RegistryStoreOptions{})
+		if store.allowCosignTag {
+			t.Error("AllowCosignTag should be false by default")
+		}
+	})
+
+	t.Run("cosign signature enabled when configured", func(t *testing.T) {
+		store := NewRegistryStore(RegistryStoreOptions{
+			AllowCosignTag: true,
+		})
+		if !store.allowCosignTag {
+			t.Error("AllowCosignTag should be true when configured")
+		}
+	})
+}
+
+func TestRegistryStore_fetchCosignSignature(t *testing.T) {
+	// Create a sample descriptor
+	manifest := []byte(`{"layers":[]}`)
+	manifestDesc := content.NewDescriptorFromBytes(ocispec.MediaTypeImageManifest, manifest)
+
+	// Create a sample cosign signature descriptor
+	cosignSig := []byte(`{"critical":{"identity":{"docker-reference":"test"}}}`)
+	cosignSigDesc := content.NewDescriptorFromBytes("application/vnd.dev.cosign.simplesigning.v1+json", cosignSig)
+
+	t.Run("cosign signature found", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodHead {
+				t.Errorf("unexpected method: %s, want HEAD", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+
+			// Expected cosign signature tag format: sha256-<hash>.sig
+			expectedSigTag := strings.ReplaceAll(manifestDesc.Digest.String(), ":", "-") + ".sig"
+			expectedPath := "/v2/test/manifests/" + expectedSigTag
+
+			if r.URL.Path != expectedPath {
+				t.Errorf("unexpected path: %s, want %s", r.URL.Path, expectedPath)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+
+			// Return the cosign signature descriptor
+			w.Header().Set("Content-Type", cosignSigDesc.MediaType)
+			w.Header().Set("Docker-Content-Digest", cosignSigDesc.Digest.String())
+			w.Header().Set("Content-Length", strconv.Itoa(int(cosignSigDesc.Size)))
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		uri, err := url.Parse(ts.URL)
+		if err != nil {
+			t.Fatalf("invalid test http server: %v", err)
+		}
+
+		store := NewRegistryStore(RegistryStoreOptions{
+			PlainHTTP:      true,
+			AllowCosignTag: true,
+		})
+
+		repo, err := store.repository(uri.Host + "/test:tag")
+		if err != nil {
+			t.Fatalf("failed to create repository: %v", err)
+		}
+
+		ctx := context.Background()
+		var receivedReferrers []ocispec.Descriptor
+		fn := func(referrers []ocispec.Descriptor) error {
+			receivedReferrers = referrers
+			return nil
+		}
+
+		err = fetchCosignSignature(ctx, repo, manifestDesc, fn)
+		if err != nil {
+			t.Errorf("fetchCosignSignature() error = %v, want nil", err)
+		}
+
+		if len(receivedReferrers) != 1 {
+			t.Fatalf("expected 1 referrer, got %d", len(receivedReferrers))
+		}
+
+		referrer := receivedReferrers[0]
+		expectedReferrer := ocispec.Descriptor{
+			MediaType:    cosignSigDesc.MediaType,
+			Digest:       cosignSigDesc.Digest,
+			Size:         cosignSigDesc.Size,
+			ArtifactType: "application/vnd.dev.cosign.artifact.sig.v1+json",
+		}
+
+		if !reflect.DeepEqual(referrer, expectedReferrer) {
+			t.Errorf("received referrer = %v, want %v", referrer, expectedReferrer)
+		}
+	})
+
+	t.Run("cosign signature not found", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodHead {
+				t.Errorf("unexpected method: %s, want HEAD", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+
+			// Return 404 for any cosign signature request
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer ts.Close()
+
+		uri, err := url.Parse(ts.URL)
+		if err != nil {
+			t.Fatalf("invalid test http server: %v", err)
+		}
+
+		store := NewRegistryStore(RegistryStoreOptions{
+			PlainHTTP:      true,
+			AllowCosignTag: true,
+		})
+
+		repo, err := store.repository(uri.Host + "/test:tag")
+		if err != nil {
+			t.Fatalf("failed to create repository: %v", err)
+		}
+
+		ctx := context.Background()
+		called := false
+		fn := func(referrers []ocispec.Descriptor) error {
+			called = true
+			return nil
+		}
+
+		err = fetchCosignSignature(ctx, repo, manifestDesc, fn)
+		if err != nil {
+			t.Errorf("fetchCosignSignature() error = %v, want nil", err)
+		}
+		if called {
+			t.Error("callback function should not be called when cosign signature is not found")
+		}
+	})
+
+	t.Run("registry error during cosign signature fetch", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodHead {
+				t.Errorf("unexpected method: %s, want HEAD", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+
+			// Return a server error
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer ts.Close()
+
+		uri, err := url.Parse(ts.URL)
+		if err != nil {
+			t.Fatalf("invalid test http server: %v", err)
+		}
+
+		store := NewRegistryStore(RegistryStoreOptions{
+			PlainHTTP:      true,
+			AllowCosignTag: true,
+		})
+
+		repo, err := store.repository(uri.Host + "/test:tag")
+		if err != nil {
+			t.Fatalf("failed to create repository: %v", err)
+		}
+
+		ctx := context.Background()
+		fn := func(referrers []ocispec.Descriptor) error {
+			return nil
+		}
+
+		err = fetchCosignSignature(ctx, repo, manifestDesc, fn)
+		if err == nil {
+			t.Error("fetchCosignSignature() error = nil, want non-nil error")
+		}
+	})
+
+	t.Run("callback function returns error", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodHead {
+				t.Errorf("unexpected method: %s, want HEAD", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+
+			// Return the cosign signature descriptor
+			w.Header().Set("Content-Type", cosignSigDesc.MediaType)
+			w.Header().Set("Docker-Content-Digest", cosignSigDesc.Digest.String())
+			w.Header().Set("Content-Length", strconv.Itoa(int(cosignSigDesc.Size)))
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		uri, err := url.Parse(ts.URL)
+		if err != nil {
+			t.Fatalf("invalid test http server: %v", err)
+		}
+
+		store := NewRegistryStore(RegistryStoreOptions{
+			PlainHTTP:      true,
+			AllowCosignTag: true,
+		})
+
+		repo, err := store.repository(uri.Host + "/test:tag")
+		if err != nil {
+			t.Fatalf("failed to create repository: %v", err)
+		}
+
+		ctx := context.Background()
+		expectedErr := fmt.Errorf("callback error")
+		fn := func(referrers []ocispec.Descriptor) error {
+			return expectedErr
+		}
+
+		err = fetchCosignSignature(ctx, repo, manifestDesc, fn)
+		if err != expectedErr {
+			t.Errorf("fetchCosignSignature() error = %v, want %v", err, expectedErr)
+		}
+	})
+
+	t.Run("cosign signature tag format verification", func(t *testing.T) {
+		// Test with various digest formats to ensure proper tag generation
+		testDigests := []digest.Digest{
+			digest.FromString("test1"),
+			digest.FromString("test2"),
+			digest.FromBytes([]byte("test3")),
+		}
+
+		for _, testDigest := range testDigests {
+			testDesc := ocispec.Descriptor{
+				MediaType: ocispec.MediaTypeImageManifest,
+				Digest:    testDigest,
+				Size:      100,
+			}
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodHead {
+					t.Errorf("unexpected method: %s, want HEAD", r.Method)
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+
+				// Verify the cosign signature tag format
+				expectedSigTag := strings.ReplaceAll(testDigest.String(), ":", "-") + ".sig"
+				expectedPath := "/v2/test/manifests/" + expectedSigTag
+
+				if r.URL.Path != expectedPath {
+					t.Errorf("unexpected path for digest %s: %s, want %s", testDigest, r.URL.Path, expectedPath)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+
+				// Return the cosign signature descriptor
+				w.Header().Set("Content-Type", cosignSigDesc.MediaType)
+				w.Header().Set("Docker-Content-Digest", cosignSigDesc.Digest.String())
+				w.Header().Set("Content-Length", strconv.Itoa(int(cosignSigDesc.Size)))
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			uri, err := url.Parse(ts.URL)
+			if err != nil {
+				t.Fatalf("invalid test http server: %v", err)
+			}
+
+			store := NewRegistryStore(RegistryStoreOptions{
+				PlainHTTP:      true,
+				AllowCosignTag: true,
+			})
+
+			repo, err := store.repository(uri.Host + "/test:tag")
+			if err != nil {
+				t.Fatalf("failed to create repository: %v", err)
+			}
+
+			ctx := context.Background()
+			called := false
+			fn := func(referrers []ocispec.Descriptor) error {
+				called = true
+				return nil
+			}
+
+			err = fetchCosignSignature(ctx, repo, testDesc, fn)
+			if err != nil {
+				t.Errorf("fetchCosignSignature() error = %v, want nil for digest %s", err, testDigest)
+			}
+			if !called {
+				t.Errorf("callback function should be called for digest %s", testDigest)
+			}
+		}
+	})
 }

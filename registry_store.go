@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2/content"
@@ -41,6 +42,10 @@ const (
 
 	// defaultUserAgent is the default user agent string sent to the registry.
 	defaultUserAgent = "ratify-go"
+
+	// artifactTypeCosign is the artifact type for cosign signatures listed as
+	// referrers.
+	artifactTypeCosign = "application/vnd.dev.cosign.artifact.sig.v1+json"
 )
 
 // RegistryCredential represents the credential to access the registry.
@@ -79,6 +84,10 @@ type RegistryStoreOptions struct {
 	// MaxManifestBytes limits the maximum size of the fetched manifest bytes.
 	// If less than or equal to zero, a default value (4 MiB) will be used.
 	MaxManifestBytes int64
+
+	// AllowCosignTag enables fetching cosign signatures with the tag format
+	// when listing referrers.
+	AllowCosignTag bool
 }
 
 // RegistryStore is a store that interacts with a remote registry.
@@ -87,6 +96,7 @@ type RegistryStore struct {
 	plainHTTP        bool
 	maxBlobBytes     int64
 	maxManifestBytes int64
+	allowCosignTag   bool
 }
 
 // NewRegistryStore creates a new [RegistryStore] with options.
@@ -119,6 +129,7 @@ func NewRegistryStore(opts RegistryStoreOptions) *RegistryStore {
 		plainHTTP:        opts.PlainHTTP,
 		maxBlobBytes:     maxBlobBytes,
 		maxManifestBytes: maxManifestBytes,
+		allowCosignTag:   opts.AllowCosignTag,
 	}
 }
 
@@ -135,6 +146,8 @@ func (s *RegistryStore) Resolve(ctx context.Context, ref string) (ocispec.Descri
 // given subject reference.
 // Note: This API supports pagination. fn should be set to handle the
 // underlying pagination.
+// If AllowCosignTag was enabled in [RegistryStoreOptions], it will also attempt 
+// to fetch cosign signatures with the sha256-<hash>.sig tag format.
 func (s *RegistryStore) ListReferrers(ctx context.Context, ref string, artifactTypes []string, fn func(referrers []ocispec.Descriptor) error) error {
 	repo, err := s.repository(ref)
 	if err != nil {
@@ -160,6 +173,12 @@ func (s *RegistryStore) ListReferrers(ctx context.Context, ref string, artifactT
 		}
 	}
 
+	if s.allowCosignTag {
+		if err := fetchCosignSignature(ctx, repo, desc, fn); err != nil {
+			return err
+		}
+	}
+	
 	// fast path: optimize call to the referrers API for the artifact type
 	// filter.
 	if len(artifactTypes) == 1 {
@@ -242,4 +261,24 @@ func (readOnlyRegistryCredentialStore) Put(_ context.Context, _ string, _ Regist
 
 func (readOnlyRegistryCredentialStore) Delete(_ context.Context, _ string) error {
 	return errors.New("registry credential: delete: not supported")
+}
+
+// fetchCosignSignature attempts to fetch cosign signature for the given
+// descriptor.
+func fetchCosignSignature(ctx context.Context, repo *remote.Repository, desc ocispec.Descriptor, fn func(referrers []ocispec.Descriptor) error) error {
+	sigTag := strings.ReplaceAll(desc.Digest.String(), ":", "-") + ".sig"
+
+	sigDesc, err := repo.Manifests().Resolve(ctx, sigTag)
+	if err != nil {
+		// if signature is not found, it's not an error - just means no cosign
+		// signature exists
+		if errors.Is(err, errdef.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	sigDesc.ArtifactType = artifactTypeCosign
+
+	return fn([]ocispec.Descriptor{sigDesc})
 }
