@@ -38,3 +38,13 @@ func TestStack(t *testing.T) {
 		t.Errorf("Expected stack to be empty")
 	}
 }
+
+func TestStack_PopEmpty(t *testing.T) {
+	s := Stack[int]{}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("Expected panic when popping from empty stack")
+		}
+	}()
+	s.Pop() // This should panic
+}

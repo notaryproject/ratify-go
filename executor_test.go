@@ -131,7 +131,6 @@ type mockEvaluator struct {
 	returnAddResultErr   bool
 	returnCommitErr      bool
 	verifierPrunedDigest string
-	artifactPrunedDigest string
 	subjectPrunedDigest  string
 }
 
@@ -148,9 +147,6 @@ func (m *mockEvaluator) Pruned(ctx context.Context, subjectDigest, artifactDiges
 	}
 	if m.verifierPrunedDigest != "" && artifactDigest == m.verifierPrunedDigest {
 		return PrunedStateVerifierPruned, nil
-	}
-	if m.artifactPrunedDigest != "" && artifactDigest == m.artifactPrunedDigest {
-		return PrunedStateArtifactPruned, nil
 	}
 	if m.subjectPrunedDigest != "" && subjectDigest == m.subjectPrunedDigest {
 		return PrunedStateSubjectPruned, nil
@@ -748,92 +744,6 @@ func TestValidateArtifact(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "Artifact pruned for artifact with digest: testDigest2",
-			opts: ValidateArtifactOptions{
-				Subject: testImage,
-			},
-			store: &mockStore{
-				tagToDesc: map[string]ocispec.Descriptor{
-					testImage: {
-						Digest: testDigest1,
-					},
-				},
-				digestToReferrers: map[string][]ocispec.Descriptor{
-					testArtifact1: {
-						{
-							Digest: testDigest2,
-						},
-						{
-							Digest: testDigest3,
-						},
-					},
-					testArtifact2: {
-						{
-							Digest: testDigest4,
-						},
-					},
-					testArtifact4: {
-						{
-							Digest: testDigest5,
-						},
-					},
-				},
-			},
-			verifiers: []Verifier{&mockVerifier{
-				verifiable: true,
-				verifyResult: map[string]*VerificationResult{
-					testDigest2: {
-						Description: validMessage2,
-					},
-					testDigest3: {
-						Description: validMessage3,
-					},
-					testDigest4: {
-						Description: validMessage4,
-					},
-					testDigest5: {
-						Description: validMessage5,
-					},
-				},
-			},
-			},
-			policyEnforcer: &mockPolicyEnforcer{
-				evaluator: &mockEvaluator{
-					artifactPrunedDigest: testDigest2,
-				},
-			},
-			want: &ValidationResult{
-				Succeeded: true,
-				ArtifactReports: []*ValidationReport{
-					{
-						Results: []*VerificationResult{
-							{
-								Description: validMessage3,
-							},
-						},
-						ArtifactReports: []*ValidationReport{},
-					},
-					{
-						ArtifactReports: []*ValidationReport{{
-							Results: []*VerificationResult{
-								{
-									Description: validMessage4,
-								},
-							},
-							ArtifactReports: []*ValidationReport{{
-								Results: []*VerificationResult{
-									{
-										Description: validMessage5,
-									},
-								},
-								ArtifactReports: []*ValidationReport{},
-							}},
-						}},
-					},
-				}},
-			wantErr: false,
-		},
-		{
 			name: "Subject pruned for subject with digest: testDigest2",
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
@@ -914,7 +824,7 @@ func TestValidateArtifact(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer)
+			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer, 100)
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateArtifact() error = %v, wantErr %v", err, tt.wantErr)
@@ -996,34 +906,45 @@ func sameVerifierReport(report1, report2 *VerificationResult) bool {
 
 func TestValidateExecutorSetup(t *testing.T) {
 	tests := []struct {
-		name      string
-		store     Store
-		verifiers []Verifier
-		wantErr   bool
+		name       string
+		store      Store
+		verifiers  []Verifier
+		maxWorkers int
+		wantErr    bool
 	}{
 		{
-			name:      "Store is not set",
-			store:     nil,
-			verifiers: []Verifier{&mockVerifier{}},
-			wantErr:   true,
+			name:       "Store is not set",
+			store:      nil,
+			verifiers:  []Verifier{&mockVerifier{}},
+			maxWorkers: 1,
+			wantErr:    true,
 		},
 		{
-			name:      "Verifiers are not set",
-			store:     &mockStore{},
-			verifiers: nil,
-			wantErr:   true,
+			name:       "Verifiers are not set",
+			store:      &mockStore{},
+			verifiers:  nil,
+			maxWorkers: 1,
+			wantErr:    true,
 		},
 		{
-			name:      "All components are set",
-			store:     &mockStore{},
-			verifiers: []Verifier{&mockVerifier{}},
-			wantErr:   false,
+			name:       "maxWorkers is zero",
+			store:      &mockStore{},
+			verifiers:  []Verifier{&mockVerifier{}},
+			maxWorkers: 0,
+			wantErr:    true,
+		},
+		{
+			name:       "All components are set",
+			store:      &mockStore{},
+			verifiers:  []Verifier{&mockVerifier{}},
+			maxWorkers: 1,
+			wantErr:    false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateExecutorSetup(tt.store, tt.verifiers)
+			err := validateExecutorSetup(tt.store, tt.verifiers, tt.maxWorkers)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateExecutorSetup() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -1102,7 +1023,7 @@ func TestValidateArtifact_SBoMNotConfigured_WithThresholdPolicy(t *testing.T) {
 		// No verifier for SBoM (artifactTypeSBoM) is configured
 	}
 
-	executor, err := NewExecutor(store, verifiers, enforcer)
+	executor, err := NewExecutor(store, verifiers, enforcer, 1)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -1201,7 +1122,7 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 		},
 	}
 
-	executor, err := NewExecutor(store, verifiers, enforcer)
+	executor, err := NewExecutor(store, verifiers, enforcer, 1)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
