@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/notaryproject/ratify-go/internal/set"
 )
@@ -132,9 +133,9 @@ type evaluationNode struct {
 	// by rule ID.
 	childNodes map[int][]*evaluationNode
 
-	// commited indicates whether more child (virtual) nodes will be added to
+	// committed indicates whether more child (virtual) nodes will be added to
 	// this node. If set to true, no more child nodes will be added to it.
-	commited bool
+	committed bool
 }
 
 func (n *evaluationNode) addChildNode(rule *ThresholdPolicyRule, artifactDigest string) *evaluationNode {
@@ -218,7 +219,7 @@ func (n *evaluationNode) calculateDecision() thresholdPolicyDecision {
 	}
 	if successfulRuleCount >= threshold {
 		n.ruleDecision = thresholdPolicyDecisionAllow
-	} else if n.commited && undeterminedRuleCount == 0 {
+	} else if n.committed && undeterminedRuleCount == 0 {
 		n.ruleDecision = thresholdPolicyDecisionDeny
 	}
 	return n.ruleDecision
@@ -267,6 +268,8 @@ type thresholdEvaluator struct {
 	// verifierIndex is the index of the evaluation nodes by concatenating subject
 	// digest, artifact digest and verifier.
 	verifierIndex map[string][]*evaluationNode
+
+	mu sync.RWMutex
 }
 
 // verifierIndexKey generates the key for the verifier index.
@@ -277,6 +280,9 @@ func verifierIndexKey(subjectDigest, artifactDigest, verifier string) string {
 // Pruned checks if whether the verifier is required to verify the subject
 // against the artifact.
 func (e *thresholdEvaluator) Pruned(ctx context.Context, subjectDigest, artifactDigest, verifier string) (PrunedState, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	if _, ok := e.verifierIndex[verifierIndexKey(subjectDigest, artifactDigest, verifier)]; ok {
 		return PrunedStateVerifierPruned, nil
 	}
@@ -313,6 +319,9 @@ func (e *thresholdEvaluator) Pruned(ctx context.Context, subjectDigest, artifact
 // AddResult adds the successful verification result of the subject against the
 // artifact to the evaluator for further evaluation.
 func (e *thresholdEvaluator) AddResult(ctx context.Context, subjectDigest, artifactDigest string, artifactResult *VerificationResult) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if artifactResult.Err != nil {
 		// Only add successful verification result to the evaluator.
 		return nil
@@ -399,8 +408,11 @@ func (e *thresholdEvaluator) createVirtualEvaluationNode(rule *ThresholdPolicyRu
 // In multi goroutine mode, commited node cannot be refreshed as it may need
 // more verification results to make a decision.
 func (e *thresholdEvaluator) Commit(ctx context.Context, subjectDigest string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	for _, node := range e.subjectIndex[subjectDigest] {
-		node.commited = true
+		node.committed = true
 		node.refreshDecision()
 	}
 	return nil
@@ -408,6 +420,9 @@ func (e *thresholdEvaluator) Commit(ctx context.Context, subjectDigest string) e
 
 // Evaluate makes the final decision based on aggregated evaluation graph.
 func (e *thresholdEvaluator) Evaluate(ctx context.Context) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// Refresh the decision for the root node.
 	e.evalGraph.refreshDecision()
 	return e.evalGraph.ruleDecision == thresholdPolicyDecisionAllow, nil

@@ -31,9 +31,6 @@ const (
 	// PrunedStateVerifierPruned is the state when the verifier is not required
 	// to verify the subject against the artifact to make a decision.
 	PrunedStateVerifierPruned
-	// PrunedStateArtifactPruned is the state when the artifact is not required
-	// to be verified against to make a decision.
-	PrunedStateArtifactPruned
 	// PrunedStateSubjectPruned is the state when the subject is not required to
 	// be verified to make a decision.
 	PrunedStateSubjectPruned
