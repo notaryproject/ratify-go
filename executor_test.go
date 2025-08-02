@@ -914,7 +914,7 @@ func TestValidateArtifact(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer)
+			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer, 1)
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateArtifact() error = %v, wantErr %v", err, tt.wantErr)
@@ -1102,7 +1102,7 @@ func TestValidateArtifact_SBoMNotConfigured_WithThresholdPolicy(t *testing.T) {
 		// No verifier for SBoM (artifactTypeSBoM) is configured
 	}
 
-	executor, err := NewExecutor(store, verifiers, enforcer)
+	executor, err := NewExecutor(store, verifiers, enforcer, 1)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -1201,7 +1201,7 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 		},
 	}
 
-	executor, err := NewExecutor(store, verifiers, enforcer)
+	executor, err := NewExecutor(store, verifiers, enforcer, 1)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}

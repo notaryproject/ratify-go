@@ -118,6 +118,59 @@ func (c *concurrencyController) tryAcquire() bool {
 	}
 }
 
+// concurrentExecutor handles the pattern of running functions either concurrently or synchronously
+type concurrentExecutor struct {
+	controller *concurrencyController
+	wg         *sync.WaitGroup
+	firstErr   *atomic.Value
+	cancel     func()
+}
+
+func newConcurrentExecutor(controller *concurrencyController, wg *sync.WaitGroup, firstErr *atomic.Value, cancel func()) *concurrentExecutor {
+	return &concurrentExecutor{
+		controller: controller,
+		wg:         wg,
+		firstErr:   firstErr,
+		cancel:     cancel,
+	}
+}
+
+// execute runs the function either concurrently (if concurrency slot available) or synchronously
+// cleanup is called in the defer of the goroutine (for concurrent execution) or after sync execution
+func (ce *concurrentExecutor) execute(fn func() error, cleanup func()) error {
+	if ce.controller.tryAcquire() {
+		ce.wg.Add(1)
+		go func() {
+			defer func() {
+				ce.controller.release()
+				if cleanup != nil {
+					cleanup()
+				}
+				ce.wg.Done()
+			}()
+
+			if err := fn(); err != nil {
+				ce.firstErr.CompareAndSwap(nil, err)
+				ce.cancel()
+			}
+		}()
+		return nil
+	} else {
+		defer func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		}()
+
+		if err := fn(); err != nil {
+			ce.firstErr.CompareAndSwap(nil, err)
+			ce.cancel()
+			return err
+		}
+		return nil
+	}
+}
+
 // ValidateArtifactOptions describes the artifact validation options.
 type ValidateArtifactOptions struct {
 	// Subject is the reference of the artifact to be validated. Required.
@@ -243,17 +296,17 @@ func (e *Executor) aggregateVerifierReports(ctx context.Context, opts ValidateAr
 	return e.processVerifierReports(ctx, rootTask, repo, opts.ReferenceTypes, evaluator)
 }
 
-type validationOpts struct {
+type workerManager struct {
 	atomicErr     atomic.Value
 	activeWorkers atomic.Int64
 	taskQueue     *concurrentTaskQueue
 }
 
-func (v *validationOpts) startValidation() {
+func (v *workerManager) startValidation() {
 	v.activeWorkers.Add(1)
 }
 
-func (v *validationOpts) endValidation() {
+func (v *workerManager) endValidation() {
 	v.activeWorkers.Add(-1)
 	if v.taskQueue.isEmpty() && v.activeWorkers.Load() == 0 {
 		v.taskQueue.close()
@@ -262,56 +315,42 @@ func (v *validationOpts) endValidation() {
 
 func (e *Executor) processVerifierReports(parentCtx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator) ([]*ValidationReport, Evaluator, error) {
 	taskQueue := newConcurrentTaskQueue()
-	concurrencyController := newConcurrencyController(e.MaxConcurrency)
-
 	taskQueue.push(task)
 
-	baseCtx, cancel := context.WithCancel(parentCtx)
+	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
+	
 	var firstErr atomic.Value
 	var wg sync.WaitGroup
+	concurrencyController := newConcurrencyController(e.MaxConcurrency)
+	concurrentExec := newConcurrentExecutor(concurrencyController, &wg, &firstErr, cancel)
 
-	opts := &validationOpts{
+	manager := &workerManager{
 		taskQueue: taskQueue,
 	}
 LOOP:
 	for {
-		opts.startValidation()
-		task, ok := opts.taskQueue.pop()
+		manager.startValidation()
+		task, ok := manager.taskQueue.pop()
 		if !ok {
 			// No more tasks to process, break the loop.
-			opts.endValidation()
+			manager.endValidation()
 			break LOOP
 		}
 
 		select {
-		case <-baseCtx.Done():
-			opts.endValidation()
+		case <-ctx.Done():
+			manager.endValidation()
 			break LOOP
 		default:
 		}
 
-		if concurrencyController.tryAcquire() {
-			wg.Add(1)
-			go func() {
-				defer func() {
-					concurrencyController.release()
-					opts.endValidation()
-					wg.Done()
-				}()
-
-				if err := e.verifySubjectAgainstReferrers(baseCtx, task, repo, referenceTypes, evaluator, concurrencyController, opts); err != nil {
-					firstErr.Store(err)
-				}
-			}()
-		} else {
-			if err := e.verifySubjectAgainstReferrers(baseCtx, task, repo, referenceTypes, evaluator, concurrencyController, opts); err != nil {
-				firstErr.Store(err)
-				cancel()
-				opts.endValidation()
-				break LOOP
-			}
-			opts.endValidation()
+		if err := concurrentExec.execute(func() error {
+			return e.verifySubjectAgainstReferrers(ctx, task, repo, referenceTypes, evaluator, concurrencyController, manager)
+		}, manager.endValidation); err != nil {
+			// Handle synchronous execution error
+			firstErr.CompareAndSwap(nil, err)
+			break LOOP
 		}
 	}
 
@@ -324,7 +363,7 @@ LOOP:
 
 // verifySubjectAgainstReferrers verifies the subject artifact against all
 // referrers in the store and produces new tasks for each referrer.
-func (e *Executor) verifySubjectAgainstReferrers(parentCtx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, concurrencyController *concurrencyController, opts *validationOpts) error {
+func (e *Executor) verifySubjectAgainstReferrers(parentCtx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, concurrencyController *concurrencyController, opts *workerManager) error {
 	artifact := task.artifact.String()
 	var artifactReports []*ValidationReport
 	var mu sync.Mutex
@@ -341,6 +380,7 @@ func (e *Executor) verifySubjectAgainstReferrers(parentCtx context.Context, task
 
 		var firstErr atomic.Value
 		var wg sync.WaitGroup
+		concurrentExec := newConcurrentExecutor(concurrencyController, &wg, &firstErr, cancel)
 
 		for _, referrer := range referrers {
 			select {
@@ -349,24 +389,12 @@ func (e *Executor) verifySubjectAgainstReferrers(parentCtx context.Context, task
 			default:
 			}
 
-			if concurrencyController.tryAcquire() {
-				wg.Add(1)
-				go func(referrer ocispec.Descriptor) {
-					defer func() {
-						concurrencyController.release()
-						wg.Done()
-					}()
-
-					if err := e.processReferrer(ctx, task, repo, referenceTypes, evaluator, referrer, artifact, concurrencyController, opts, addArtifactReport); err != nil {
-						firstErr.CompareAndSwap(nil, err)
-						cancel()
-					}
-				}(referrer)
-			} else {
-				if err := e.processReferrer(ctx, task, repo, referenceTypes, evaluator, referrer, artifact, concurrencyController, opts, addArtifactReport); err != nil {
-					firstErr.CompareAndSwap(nil, err)
-					cancel()
-				}
+			if err := concurrentExec.execute(func() error {
+				return e.processReferrer(ctx, task, repo, referenceTypes, evaluator, referrer, artifact, concurrencyController, opts, addArtifactReport)
+			}, nil); err != nil {
+				// Handle synchronous execution error
+				firstErr.CompareAndSwap(nil, err)
+				break
 			}
 		}
 		wg.Wait()
@@ -391,7 +419,7 @@ func (e *Executor) verifySubjectAgainstReferrers(parentCtx context.Context, task
 	return nil
 }
 
-func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, concurrencyController *concurrencyController, opts *validationOpts, addArtifactReport func(*ValidationReport)) error {
+func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, concurrencyController *concurrencyController, opts *workerManager, addArtifactReport func(*ValidationReport)) error {
 	results, err := e.verifyArtifact(ctx, repo, task.artifactDesc, referrer, evaluator, concurrencyController)
 	if err != nil {
 		if errors.Is(err, errSubjectPruned) && len(results) > 0 {
@@ -440,8 +468,10 @@ func (e *Executor) verifyArtifact(parentCtx context.Context, repo string, subjec
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
+
 	var wg sync.WaitGroup
 	var firstErr atomic.Value
+	concurrentExec := newConcurrentExecutor(controller, &wg, &firstErr, cancel)
 
 	for _, verifier := range e.Verifiers {
 		select {
@@ -454,27 +484,12 @@ func (e *Executor) verifyArtifact(parentCtx context.Context, repo string, subjec
 			continue
 		}
 
-		if controller.tryAcquire() {
-			wg.Add(1)
-			go func(verifier Verifier) {
-				defer func() {
-					controller.release()
-					wg.Done()
-				}()
-
-				err := e.processVerifier(ctx, subjectDesc, repo, artifact, verifier, evaluator, addVerifierReports)
-				if err != nil {
-					cancel()
-					firstErr.CompareAndSwap(nil, err)
-				}
-			}(verifier)
-		} else {
-			err := e.processVerifier(ctx, subjectDesc, repo, artifact, verifier, evaluator, addVerifierReports)
-			if err != nil {
-				cancel()
-				firstErr.CompareAndSwap(nil, err)
-				break
-			}
+		if err := concurrentExec.execute(func() error {
+			return e.processVerifier(ctx, subjectDesc, repo, artifact, verifier, evaluator, addVerifierReports)
+		}, nil); err != nil {
+			// Handle synchronous execution error
+			firstErr.CompareAndSwap(nil, err)
+			break
 		}
 	}
 
