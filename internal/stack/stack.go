@@ -30,7 +30,7 @@ func (s *Stack[T]) Pop() T {
 	return t
 }
 
-// IsEmpty checks if the stack is empty.
+// Len returns the number of items in the stack.
 func (s *Stack[T]) Len() int {
 	return len(*s)
 }

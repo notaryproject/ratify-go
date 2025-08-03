@@ -23,6 +23,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/notaryproject/ratify-go/internal/concurrency"
+	"github.com/notaryproject/ratify-go/internal/stack"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2/registry"
 )
@@ -30,146 +32,6 @@ import (
 // errSubjectPruned is returned when the evaluator does not need given subject
 // to be verified to make a decision by [Evaluator.Pruned].
 var errSubjectPruned = errors.New("evaluator sub-graph is pruned for the subject")
-
-// concurrentTaskQueue is a thread-safe task queue for concurrent processing
-type concurrentTaskQueue struct {
-	mu    sync.Mutex
-	tasks []*executorTask
-	cond  *sync.Cond
-	done  bool
-}
-
-func newConcurrentTaskQueue() *concurrentTaskQueue {
-	q := &concurrentTaskQueue{}
-	q.cond = sync.NewCond(&q.mu)
-	return q
-}
-
-func (q *concurrentTaskQueue) isEmpty() bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.tasks) == 0 && !q.done
-}
-
-func (q *concurrentTaskQueue) push(tasks ...*executorTask) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.done {
-		return // Don't add tasks to a closed queue
-	}
-	q.tasks = append(q.tasks, tasks...)
-	q.cond.Broadcast()
-}
-
-func (q *concurrentTaskQueue) pop() (task *executorTask, success bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	for len(q.tasks) == 0 && !q.done {
-		q.cond.Wait()
-	}
-
-	if len(q.tasks) == 0 {
-		return nil, false
-	}
-
-	task = q.tasks[len(q.tasks)-1]
-	q.tasks = q.tasks[:len(q.tasks)-1]
-	return task, true
-}
-
-func (q *concurrentTaskQueue) close() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.done = true
-	q.cond.Broadcast()
-}
-
-// concurrencyController manages the available goroutine slots
-type concurrencyController struct {
-	semaphore chan struct{}
-}
-
-func newConcurrencyController(maxConcurrency int) *concurrencyController {
-	if maxConcurrency <= 1 {
-		return &concurrencyController{}
-	}
-	return &concurrencyController{
-		semaphore: make(chan struct{}, maxConcurrency-1),
-	}
-}
-
-func (c *concurrencyController) release() {
-	if c.semaphore != nil {
-		<-c.semaphore
-	}
-}
-
-func (c *concurrencyController) tryAcquire() bool {
-	if c.semaphore == nil {
-		return false
-	}
-
-	select {
-	case c.semaphore <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-
-// concurrentExecutor handles the pattern of running functions either concurrently or synchronously
-type concurrentExecutor struct {
-	controller *concurrencyController
-	wg         *sync.WaitGroup
-	firstErr   *atomic.Value
-	cancel     func()
-}
-
-func newConcurrentExecutor(controller *concurrencyController, wg *sync.WaitGroup, firstErr *atomic.Value, cancel func()) *concurrentExecutor {
-	return &concurrentExecutor{
-		controller: controller,
-		wg:         wg,
-		firstErr:   firstErr,
-		cancel:     cancel,
-	}
-}
-
-// execute runs the function either concurrently (if concurrency slot available) or synchronously
-// cleanup is called in the defer of the goroutine (for concurrent execution) or after sync execution
-func (ce *concurrentExecutor) execute(fn func() error, cleanup func()) error {
-	if ce.controller.tryAcquire() {
-		ce.wg.Add(1)
-		go func() {
-			defer func() {
-				ce.controller.release()
-				if cleanup != nil {
-					cleanup()
-				}
-				ce.wg.Done()
-			}()
-
-			if err := fn(); err != nil {
-				ce.firstErr.CompareAndSwap(nil, err)
-				ce.cancel()
-			}
-		}()
-		return nil
-	} else {
-		defer func() {
-			if cleanup != nil {
-				cleanup()
-			}
-		}()
-
-		if err := fn(); err != nil {
-			ce.firstErr.CompareAndSwap(nil, err)
-			ce.cancel()
-			return err
-		}
-		return nil
-	}
-}
 
 // ValidateArtifactOptions describes the artifact validation options.
 type ValidateArtifactOptions struct {
@@ -236,6 +98,7 @@ func NewExecutor(store Store, verifiers []Verifier, policyEnforcer PolicyEnforce
 		Store:          store,
 		Verifiers:      verifiers,
 		PolicyEnforcer: policyEnforcer,
+		MaxConcurrency: maxConcurrency,
 	}, nil
 }
 
@@ -285,7 +148,6 @@ func (e *Executor) aggregateVerifierReports(ctx context.Context, opts ValidateAr
 		}
 	}
 
-	// Enqueue the subject artifact as the first task.
 	rootTask := &executorTask{
 		artifact:     ref,
 		artifactDesc: desc,
@@ -293,113 +155,90 @@ func (e *Executor) aggregateVerifierReports(ctx context.Context, opts ValidateAr
 			Artifact: desc,
 		},
 	}
-	return e.processVerifierReports(ctx, rootTask, repo, opts.ReferenceTypes, evaluator)
+	return e.processTasks(ctx, rootTask, repo, opts.ReferenceTypes, evaluator)
 }
 
-type workerManager struct {
-	atomicErr     atomic.Value
-	activeWorkers atomic.Int64
-	taskQueue     *concurrentTaskQueue
-}
-
-func (v *workerManager) startValidation() {
-	v.activeWorkers.Add(1)
-}
-
-func (v *workerManager) endValidation() {
-	v.activeWorkers.Add(-1)
-	if v.taskQueue.isEmpty() && v.activeWorkers.Load() == 0 {
-		v.taskQueue.close()
-	}
-}
-
-func (e *Executor) processVerifierReports(parentCtx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator) ([]*ValidationReport, Evaluator, error) {
-	taskQueue := newConcurrentTaskQueue()
-	taskQueue.push(task)
-
-	ctx, cancel := context.WithCancel(parentCtx)
+// processTasks processes the tasks in the worker manager and returns the
+// aggregated reports and the evaluator.
+func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator) ([]*ValidationReport, Evaluator, error) {
+	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	
-	var firstErr atomic.Value
-	var wg sync.WaitGroup
-	concurrencyController := newConcurrencyController(e.MaxConcurrency)
-	concurrentExec := newConcurrentExecutor(concurrencyController, &wg, &firstErr, cancel)
 
-	manager := &workerManager{
-		taskQueue: taskQueue,
-	}
+	var firstErr atomic.Pointer[error]
+	var wg sync.WaitGroup
+	concurrencyPool := concurrency.NewPool(e.MaxConcurrency)
+	sched := newScheduler(concurrencyPool, &wg, &firstErr, cancel)
+
+	manager := newWorkerManager()
+	manager.pushTask(task)
 LOOP:
 	for {
-		manager.startValidation()
-		task, ok := manager.taskQueue.pop()
+		task, ok := manager.popTask()
 		if !ok {
 			// No more tasks to process, break the loop.
-			manager.endValidation()
 			break LOOP
 		}
 
 		select {
-		case <-ctx.Done():
-			manager.endValidation()
+		case <-childCtx.Done():
+			manager.cleanup()
 			break LOOP
 		default:
 		}
 
-		if err := concurrentExec.execute(func() error {
-			return e.verifySubjectAgainstReferrers(ctx, task, repo, referenceTypes, evaluator, concurrencyController, manager)
-		}, manager.endValidation); err != nil {
+		if err := sched.execute(func() error {
+			return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, concurrencyPool, manager)
+		}, manager.cleanup); err != nil {
 			// Handle synchronous execution error
-			firstErr.CompareAndSwap(nil, err)
+			firstErr.CompareAndSwap(nil, &err)
 			break LOOP
 		}
 	}
 
-	wg.Wait()
+	if err := waitWithContext(childCtx, &wg); err != nil {
+		// Context was cancelled, return early
+		return nil, nil, err
+	}
 	if err := firstErr.Load(); err != nil {
-		return nil, nil, err.(error)
+		return nil, nil, *err
 	}
 	return task.subjectReport.ArtifactReports, evaluator, nil
 }
 
 // verifySubjectAgainstReferrers verifies the subject artifact against all
 // referrers in the store and produces new tasks for each referrer.
-func (e *Executor) verifySubjectAgainstReferrers(parentCtx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, concurrencyController *concurrencyController, opts *workerManager) error {
+func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, concurrencyPool *concurrency.Pool, manager *workerManager) error {
 	artifact := task.artifact.String()
-	var artifactReports []*ValidationReport
-	var mu sync.Mutex
-
-	addArtifactReport := func(report *ValidationReport) {
-		mu.Lock()
-		artifactReports = append(artifactReports, report)
-		mu.Unlock()
-	}
-
-	err := e.Store.ListReferrers(parentCtx, artifact, referenceTypes, func(referrers []ocispec.Descriptor) error {
-		ctx, cancel := context.WithCancel(parentCtx)
+	addArtifactReport, getArtifactReports := createThreadSafeCollector[*ValidationReport]()
+	err := e.Store.ListReferrers(ctx, artifact, referenceTypes, func(referrers []ocispec.Descriptor) error {
+		childCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		var firstErr atomic.Value
+		var firstErr atomic.Pointer[error]
 		var wg sync.WaitGroup
-		concurrentExec := newConcurrentExecutor(concurrencyController, &wg, &firstErr, cancel)
+		sched := newScheduler(concurrencyPool, &wg, &firstErr, cancel)
 
 		for _, referrer := range referrers {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-childCtx.Done():
+				return childCtx.Err()
 			default:
 			}
 
-			if err := concurrentExec.execute(func() error {
-				return e.processReferrer(ctx, task, repo, referenceTypes, evaluator, referrer, artifact, concurrencyController, opts, addArtifactReport)
+			if err := sched.execute(func() error {
+				return e.processReferrer(childCtx, task, repo, evaluator, referrer, artifact, concurrencyPool, manager, addArtifactReport)
 			}, nil); err != nil {
 				// Handle synchronous execution error
-				firstErr.CompareAndSwap(nil, err)
+				firstErr.CompareAndSwap(nil, &err)
 				break
 			}
 		}
-		wg.Wait()
+		if err := waitWithContext(childCtx, &wg); err != nil {
+			// Context was cancelled, return early
+			return err
+		}
 		if err := firstErr.Load(); err != nil {
-			return err.(error)
+			return *err
 		}
 		return nil
 	})
@@ -410,17 +249,19 @@ func (e *Executor) verifySubjectAgainstReferrers(parentCtx context.Context, task
 		}
 	}
 	if evaluator != nil {
-		if err := evaluator.Commit(parentCtx, task.artifactDesc.Digest.String()); err != nil {
+		if err := evaluator.Commit(ctx, task.artifactDesc.Digest.String()); err != nil {
 			return fmt.Errorf("failed to commit the artifact %s: %w", artifact, err)
 		}
 	}
-	task.subjectReport.ArtifactReports = append(task.subjectReport.ArtifactReports, artifactReports...)
+	task.subjectReport.ArtifactReports = append(task.subjectReport.ArtifactReports, getArtifactReports()...)
 
 	return nil
 }
 
-func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, concurrencyController *concurrencyController, opts *workerManager, addArtifactReport func(*ValidationReport)) error {
-	results, err := e.verifyArtifact(ctx, repo, task.artifactDesc, referrer, evaluator, concurrencyController)
+// processReferrer processes a single referrer artifact, verifies it, and
+// creates a new task for it if necessary.
+func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, concurrencyPool *concurrency.Pool, manager *workerManager, addArtifactReport func(*ValidationReport)) error {
+	results, err := e.verifyArtifact(ctx, repo, task.artifactDesc, referrer, evaluator, concurrencyPool)
 	if err != nil {
 		if errors.Is(err, errSubjectPruned) && len(results) > 0 {
 			// it is possible that one or some verifiers' reports in the
@@ -450,33 +291,25 @@ func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo
 		artifactDesc:  referrer,
 		subjectReport: artifactReport,
 	}
-	opts.taskQueue.push(newTask)
+	manager.pushTask(newTask)
 	return nil
 }
 
 // verifyArtifact verifies the artifact by all configured verifiers and returns
 // error if any of the verifier fails.
-func (e *Executor) verifyArtifact(parentCtx context.Context, repo string, subjectDesc, artifact ocispec.Descriptor, evaluator Evaluator, controller *concurrencyController) ([]*VerificationResult, error) {
-	var verifierReports []*VerificationResult
-	var mu sync.Mutex
-
-	addVerifierReports := func(report *VerificationResult) {
-		mu.Lock()
-		defer mu.Unlock()
-		verifierReports = append(verifierReports, report)
-	}
-
-	ctx, cancel := context.WithCancel(parentCtx)
+func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc, artifact ocispec.Descriptor, evaluator Evaluator, pool *concurrency.Pool) ([]*VerificationResult, error) {
+	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
-	var firstErr atomic.Value
-	concurrentExec := newConcurrentExecutor(controller, &wg, &firstErr, cancel)
+	var firstErr atomic.Pointer[error]
+	sched := newScheduler(pool, &wg, &firstErr, cancel)
+	addVerifierReports, getVerifierReports := createThreadSafeCollector[*VerificationResult]()
 
 	for _, verifier := range e.Verifiers {
 		select {
-		case <-ctx.Done():
-			return verifierReports, ctx.Err()
+		case <-childCtx.Done():
+			return getVerifierReports(), childCtx.Err()
 		default:
 		}
 
@@ -484,23 +317,28 @@ func (e *Executor) verifyArtifact(parentCtx context.Context, repo string, subjec
 			continue
 		}
 
-		if err := concurrentExec.execute(func() error {
-			return e.processVerifier(ctx, subjectDesc, repo, artifact, verifier, evaluator, addVerifierReports)
+		if err := sched.execute(func() error {
+			return e.processVerifier(childCtx, subjectDesc, repo, artifact, verifier, evaluator, addVerifierReports)
 		}, nil); err != nil {
 			// Handle synchronous execution error
-			firstErr.CompareAndSwap(nil, err)
+			firstErr.CompareAndSwap(nil, &err)
 			break
 		}
 	}
 
-	wg.Wait()
+	if err := waitWithContext(childCtx, &wg); err != nil {
+		// Context was cancelled, return early
+		return getVerifierReports(), err
+	}
 	if err := firstErr.Load(); err != nil {
-		return verifierReports, err.(error)
+		return getVerifierReports(), *err
 	}
 
-	return verifierReports, nil
+	return getVerifierReports(), nil
 }
 
+// processVerifier processes a single verifier, verifies the subject against
+// the artifact, and adds the report to the evaluator if available.
 func (e *Executor) processVerifier(ctx context.Context, subjectDesc ocispec.Descriptor, repo string, artifact ocispec.Descriptor, verifier Verifier, evaluator Evaluator, addVerifierReports func(report *VerificationResult)) error {
 	if evaluator != nil {
 		prunedState, err := evaluator.Pruned(ctx, subjectDesc.Digest.String(), artifact.Digest.String(), verifier.Name())
@@ -586,4 +424,171 @@ func validateExecutorSetup(store Store, verifiers []Verifier) error {
 		return fmt.Errorf("at least one verifier must be configured")
 	}
 	return nil
+}
+
+// scheduler handles the pattern of running functions either
+// concurrently or synchronously
+type scheduler struct {
+	pool     *concurrency.Pool
+	wg       *sync.WaitGroup
+	firstErr *atomic.Pointer[error] // holds the first error encountered during execution
+	cancel   func()
+}
+
+func newScheduler(pool *concurrency.Pool, wg *sync.WaitGroup, firstErr *atomic.Pointer[error], cancel func()) *scheduler {
+	return &scheduler{
+		pool:     pool,
+		wg:       wg,
+		firstErr: firstErr,
+		cancel:   cancel,
+	}
+}
+
+// execute runs the function either concurrently (if concurrency slot available)
+// or synchronously.
+// cleanup is called in the defer of the goroutine (for concurrent execution) or
+// after sync execution.
+func (s *scheduler) execute(fn func() error, cleanup func()) error {
+	if s.pool.TryAcquire() {
+		s.wg.Add(1)
+		go func() {
+			defer func() {
+				s.pool.Release()
+				s.wg.Done()
+				if cleanup != nil {
+					cleanup()
+				}
+			}()
+
+			if err := fn(); err != nil {
+				s.firstErr.CompareAndSwap(nil, &err)
+				s.cancel()
+			}
+		}()
+		return nil
+	} else {
+		defer func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		}()
+
+		if err := fn(); err != nil {
+			s.firstErr.CompareAndSwap(nil, &err)
+			s.cancel()
+			return err
+		}
+		return nil
+	}
+}
+
+// workerManager manages the worker pool and task stack for concurrent execution.
+type workerManager struct {
+	mu            sync.Mutex
+	cond          *sync.Cond
+	activeWorkers int64
+	taskStack     *stack.Stack[*executorTask]
+	closed        bool
+}
+
+func newWorkerManager() *workerManager {
+	m := &workerManager{
+		taskStack: &stack.Stack[*executorTask]{},
+	}
+	m.cond = sync.NewCond(&m.mu)
+	return m
+}
+
+// popTask atomically pops a task from the stack and increments active workers.
+func (m *workerManager) popTask() (*executorTask, bool) {
+	m.mu.Lock()
+	defer func() {
+		m.mu.Unlock()
+	}()
+
+	// Wait for a task to be available or for the manager to be closed
+	for m.taskStack.Len() == 0 && !m.closed {
+		m.cond.Wait()
+	}
+
+	// Check if we're closed and no more tasks
+	if m.closed && m.taskStack.Len() == 0 {
+		return nil, false
+	}
+	m.activeWorkers++
+	return m.taskStack.Pop(), true
+}
+
+// pushTask pushes a task and signals waiting goroutines.
+func (m *workerManager) pushTask(task *executorTask) {
+	m.mu.Lock()
+	defer func() {
+		m.mu.Unlock()
+	}()
+
+	if m.closed {
+		return
+	}
+
+	m.taskStack.Push(task)
+	m.cond.Signal()
+}
+
+// cleanup atomically decrements active workers and closes stack if needed.
+func (m *workerManager) cleanup() {
+	m.mu.Lock()
+	defer func() {
+		m.mu.Unlock()
+	}()
+
+	m.activeWorkers--
+	if m.taskStack.Len() == 0 && m.activeWorkers == 0 && !m.closed {
+		m.closed = true
+		m.cond.Broadcast()
+	}
+}
+
+// createThreadSafeCollector creates a thread-safe function to collect items of
+// type T and returns the collector function and a function to get the collected
+// items.
+func createThreadSafeCollector[T any]() (func(T), func() []T) {
+	var items []T
+	var mu sync.Mutex
+
+	addItem := func(item T) {
+		mu.Lock()
+		defer mu.Unlock()
+		items = append(items, item)
+	}
+
+	getItems := func() []T {
+		mu.Lock()
+		defer mu.Unlock()
+		result := make([]T, len(items))
+		copy(result, items)
+		return result
+	}
+
+	return addItem, getItems
+}
+
+// waitWithContext waits for either the WaitGroup to complete or the context to
+// be cancelled. It returns nil if WaitGroup completed successfully, or an error
+// if the context was cancelled and an error occurred.
+func waitWithContext(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		if err := ctx.Err(); !errors.Is(err, context.Canceled) {
+			return err
+		}
+		return nil
+	}
 }
