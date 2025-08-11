@@ -18,6 +18,7 @@ package ratify
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -914,7 +915,8 @@ func TestValidateArtifact(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer, 1)
+			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer)
+			executor.MaxConcurrency = 0
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateArtifact() error = %v, wantErr %v", err, tt.wantErr)
@@ -1023,7 +1025,7 @@ func TestValidateExecutorSetup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateExecutorSetup(tt.store, tt.verifiers)
+			err := validateExecutorSetup(tt.store, tt.verifiers, 1)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateExecutorSetup() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -1102,7 +1104,7 @@ func TestValidateArtifact_SBoMNotConfigured_WithThresholdPolicy(t *testing.T) {
 		// No verifier for SBoM (artifactTypeSBoM) is configured
 	}
 
-	executor, err := NewExecutor(store, verifiers, enforcer, 1)
+	executor, err := NewExecutor(store, verifiers, enforcer)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -1201,7 +1203,7 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 		},
 	}
 
-	executor, err := NewExecutor(store, verifiers, enforcer, 1)
+	executor, err := NewExecutor(store, verifiers, enforcer)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -1235,7 +1237,7 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 	tests := []struct {
 		name           string
-		maxConcurrency int
+		maxConcurrency int64
 		opts           ValidateArtifactOptions
 		store          Store
 		verifiers      []Verifier
@@ -1489,10 +1491,11 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			executor, err := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer, tt.maxConcurrency)
+			executor, err := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer)
 			if err != nil {
 				t.Fatalf("Failed to create executor: %v", err)
 			}
+			executor.MaxConcurrency = tt.maxConcurrency
 
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
@@ -1511,87 +1514,88 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 	}
 }
 
-// func TestValidateArtifact_ConcurrentRaceConditions(t *testing.T) {
-// 	// This test specifically checks for race conditions by running the same
-// 	// validation multiple times concurrently
-// 	store := &mockStore{
-// 		tagToDesc: map[string]ocispec.Descriptor{
-// 			testImage: {
-// 				Digest: testDigest1,
-// 			},
-// 		},
-// 		digestToReferrers: map[string][]ocispec.Descriptor{
-// 			testArtifact1: {
-// 				{Digest: testDigest2},
-// 				{Digest: testDigest3},
-// 				{Digest: testDigest4},
-// 				{Digest: testDigest5},
-// 			},
-// 		},
-// 	}
+func TestValidateArtifact_ConcurrentRaceConditions(t *testing.T) {
+	// This test specifically checks for race conditions by running the same
+	// validation multiple times concurrently
+	store := &mockStore{
+		tagToDesc: map[string]ocispec.Descriptor{
+			testImage: {
+				Digest: testDigest1,
+			},
+		},
+		digestToReferrers: map[string][]ocispec.Descriptor{
+			testArtifact1: {
+				{Digest: testDigest2},
+				{Digest: testDigest3},
+				{Digest: testDigest4},
+				{Digest: testDigest5},
+			},
+		},
+	}
 
-// 	verifiers := []Verifier{&mockVerifier{
-// 		verifiable: true,
-// 		verifyResult: map[string]*VerificationResult{
-// 			testDigest2: {Description: validMessage2},
-// 			testDigest3: {Description: validMessage3},
-// 			testDigest4: {Description: validMessage4},
-// 			testDigest5: {Description: validMessage5},
-// 		},
-// 	}}
+	verifiers := []Verifier{&mockVerifier{
+		verifiable: true,
+		verifyResult: map[string]*VerificationResult{
+			testDigest2: {Description: validMessage2},
+			testDigest3: {Description: validMessage3},
+			testDigest4: {Description: validMessage4},
+			testDigest5: {Description: validMessage5},
+		},
+	}}
 
-// 	policyEnforcer := &mockPolicyEnforcer{
-// 		evaluator: &mockEvaluator{},
-// 	}
+	policyEnforcer := &mockPolicyEnforcer{
+		evaluator: &mockEvaluator{},
+	}
 
-// 	executor, err := NewExecutor(store, verifiers, policyEnforcer, 4)
-// 	if err != nil {
-// 		t.Fatalf("Failed to create executor: %v", err)
-// 	}
+	executor, err := NewExecutor(store, verifiers, policyEnforcer)
+	if err != nil {
+		t.Fatalf("Failed to create executor: %v", err)
+	}
+	executor.MaxConcurrency = 4 // Set a reasonable concurrency limit for the test
 
-// 	opts := ValidateArtifactOptions{
-// 		Subject: testImage,
-// 	}
+	opts := ValidateArtifactOptions{
+		Subject: testImage,
+	}
 
-// 	// Run multiple validations concurrently to test for race conditions
-// 	const numConcurrentValidations = 10
-// 	var wg sync.WaitGroup
-// 	results := make([]*ValidationResult, numConcurrentValidations)
-// 	errors := make([]error, numConcurrentValidations)
+	// Run multiple validations concurrently to test for race conditions
+	const numConcurrentValidations = 10
+	var wg sync.WaitGroup
+	results := make([]*ValidationResult, numConcurrentValidations)
+	errors := make([]error, numConcurrentValidations)
 
-// 	for i := 0; i < numConcurrentValidations; i++ {
-// 		wg.Add(1)
-// 		go func(index int) {
-// 			defer wg.Done()
-// 			result, err := executor.ValidateArtifact(context.Background(), opts)
-// 			results[index] = result
-// 			errors[index] = err
-// 		}(i)
-// 	}
+	for i := 0; i < numConcurrentValidations; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			result, err := executor.ValidateArtifact(context.Background(), opts)
+			results[index] = result
+			errors[index] = err
+		}(i)
+	}
 
-// 	wg.Wait()
+	wg.Wait()
 
-// 	// Verify all validations succeeded
-// 	for i := 0; i < numConcurrentValidations; i++ {
-// 		if errors[i] != nil {
-// 			t.Errorf("Validation %d failed with error: %v", i, errors[i])
-// 		}
-// 		if results[i] == nil {
-// 			t.Errorf("Validation %d returned nil result", i)
-// 			continue
-// 		}
-// 		if !results[i].Succeeded {
-// 			t.Errorf("Validation %d failed", i)
-// 		}
-// 		if len(results[i].ArtifactReports) != 4 {
-// 			t.Errorf("Validation %d returned %d reports, expected 4", i, len(results[i].ArtifactReports))
-// 		}
-// 	}
+	// Verify all validations succeeded
+	for i := 0; i < numConcurrentValidations; i++ {
+		if errors[i] != nil {
+			t.Errorf("Validation %d failed with error: %v", i, errors[i])
+		}
+		if results[i] == nil {
+			t.Errorf("Validation %d returned nil result", i)
+			continue
+		}
+		if !results[i].Succeeded {
+			t.Errorf("Validation %d failed", i)
+		}
+		if len(results[i].ArtifactReports) != 4 {
+			t.Errorf("Validation %d returned %d reports, expected 4", i, len(results[i].ArtifactReports))
+		}
+	}
 
-// 	// Verify all results are consistent
-// 	for i := 1; i < numConcurrentValidations; i++ {
-// 		if !sameValidationResult(results[0], results[i]) {
-// 			t.Errorf("Results are inconsistent between validation 0 and %d", i)
-// 		}
-// 	}
-// }
+	// Verify all results are consistent
+	for i := 1; i < numConcurrentValidations; i++ {
+		if !sameValidationResult(results[0], results[i]) {
+			t.Errorf("Results are inconsistent between validation 0 and %d", i)
+		}
+	}
+}

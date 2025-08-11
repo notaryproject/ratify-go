@@ -19,15 +19,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
-	"github.com/notaryproject/ratify-go/internal/concurrency"
 	"github.com/notaryproject/ratify-go/internal/stack"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/semaphore"
 	"oras.land/oras-go/v2/registry"
 )
+
+const defaultConcurrency = 3
 
 // errSubjectPruned is returned when the evaluator does not need given subject
 // to be verified to make a decision by [Evaluator.Pruned].
@@ -75,36 +76,29 @@ type Executor struct {
 	PolicyEnforcer PolicyEnforcer
 
 	// MaxConcurrency is the maximum number of goroutines that can be created
-	// for each artifact validation request. If set to 1, single thread mode is
-	// used. If set to 0, defaults to runtime.NumCPU().
+	// for each artifact validation request. The default value is 3 if not set.
 	// Optional.
-	MaxConcurrency int
+	MaxConcurrency int64
 }
 
 // NewExecutor creates a new executor with the given verifiers, store, and
 // policy enforcer.
-func NewExecutor(store Store, verifiers []Verifier, policyEnforcer PolicyEnforcer, maxConcurrency int) (*Executor, error) {
-	if err := validateExecutorSetup(store, verifiers); err != nil {
+func NewExecutor(store Store, verifiers []Verifier, policyEnforcer PolicyEnforcer) (*Executor, error) {
+	if err := validateExecutorSetup(store, verifiers, defaultConcurrency); err != nil {
 		return nil, err
-	}
-	if maxConcurrency < 0 {
-		return nil, fmt.Errorf("maxConcurrency must be non-negative, got %d", maxConcurrency)
-	}
-	if maxConcurrency == 0 {
-		maxConcurrency = runtime.NumCPU() // default to number of CPUs
 	}
 
 	return &Executor{
 		Store:          store,
 		Verifiers:      verifiers,
 		PolicyEnforcer: policyEnforcer,
-		MaxConcurrency: maxConcurrency,
+		MaxConcurrency: defaultConcurrency,
 	}, nil
 }
 
 // ValidateArtifact returns the result of verifying an artifact.
 func (e *Executor) ValidateArtifact(ctx context.Context, opts ValidateArtifactOptions) (*ValidationResult, error) {
-	if err := validateExecutorSetup(e.Store, e.Verifiers); err != nil {
+	if err := validateExecutorSetup(e.Store, e.Verifiers, e.MaxConcurrency); err != nil {
 		return nil, err
 	}
 
@@ -166,8 +160,8 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 
 	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
-	concurrencyPool := concurrency.NewPool(e.MaxConcurrency)
-	sched := newScheduler(concurrencyPool, &wg, &firstErr, cancel)
+	sem := semaphore.NewWeighted(e.MaxConcurrency)
+	sched := newScheduler(sem, &wg, &firstErr, cancel)
 
 	manager := newWorkerManager()
 	manager.pushTask(task)
@@ -187,7 +181,7 @@ LOOP:
 		}
 
 		if err := sched.execute(func() error {
-			return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, concurrencyPool, manager)
+			return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, sem, manager)
 		}, manager.cleanup); err != nil {
 			// Handle synchronous execution error
 			firstErr.CompareAndSwap(nil, &err)
@@ -207,7 +201,7 @@ LOOP:
 
 // verifySubjectAgainstReferrers verifies the subject artifact against all
 // referrers in the store and produces new tasks for each referrer.
-func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, concurrencyPool *concurrency.Pool, manager *workerManager) error {
+func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, sem *semaphore.Weighted, manager *workerManager) error {
 	artifact := task.artifact.String()
 	addArtifactReport, getArtifactReports := createThreadSafeCollector[*ValidationReport]()
 	err := e.Store.ListReferrers(ctx, artifact, referenceTypes, func(referrers []ocispec.Descriptor) error {
@@ -216,7 +210,7 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 
 		var firstErr atomic.Pointer[error]
 		var wg sync.WaitGroup
-		sched := newScheduler(concurrencyPool, &wg, &firstErr, cancel)
+		sched := newScheduler(sem, &wg, &firstErr, cancel)
 
 		for _, referrer := range referrers {
 			select {
@@ -226,7 +220,7 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 			}
 
 			if err := sched.execute(func() error {
-				return e.processReferrer(childCtx, task, repo, evaluator, referrer, artifact, concurrencyPool, manager, addArtifactReport)
+				return e.processReferrer(childCtx, task, repo, evaluator, referrer, artifact, sem, manager, addArtifactReport)
 			}, nil); err != nil {
 				// Handle synchronous execution error
 				firstErr.CompareAndSwap(nil, &err)
@@ -260,8 +254,8 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 
 // processReferrer processes a single referrer artifact, verifies it, and
 // creates a new task for it if necessary.
-func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, concurrencyPool *concurrency.Pool, manager *workerManager, addArtifactReport func(*ValidationReport)) error {
-	results, err := e.verifyArtifact(ctx, repo, task.artifactDesc, referrer, evaluator, concurrencyPool)
+func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, sem *semaphore.Weighted, manager *workerManager, addArtifactReport func(*ValidationReport)) error {
+	results, err := e.verifyArtifact(ctx, repo, task.artifactDesc, referrer, evaluator, sem)
 	if err != nil {
 		if errors.Is(err, errSubjectPruned) && len(results) > 0 {
 			// it is possible that one or some verifiers' reports in the
@@ -297,13 +291,13 @@ func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo
 
 // verifyArtifact verifies the artifact by all configured verifiers and returns
 // error if any of the verifier fails.
-func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc, artifact ocispec.Descriptor, evaluator Evaluator, pool *concurrency.Pool) ([]*VerificationResult, error) {
+func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc, artifact ocispec.Descriptor, evaluator Evaluator, sem *semaphore.Weighted) ([]*VerificationResult, error) {
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
 	var firstErr atomic.Pointer[error]
-	sched := newScheduler(pool, &wg, &firstErr, cancel)
+	sched := newScheduler(sem, &wg, &firstErr, cancel)
 	addVerifierReports, getVerifierReports := createThreadSafeCollector[*VerificationResult]()
 
 	for _, verifier := range e.Verifiers {
@@ -416,28 +410,31 @@ type executorTask struct {
 	subjectReport *ValidationReport
 }
 
-func validateExecutorSetup(store Store, verifiers []Verifier) error {
+func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int64) error {
 	if store == nil {
 		return fmt.Errorf("store must be configured")
 	}
 	if len(verifiers) == 0 {
 		return fmt.Errorf("at least one verifier must be configured")
 	}
+	if concurrency < 0 {
+		return fmt.Errorf("maxConcurrency must be greater than or equal to 0, got %d", concurrency)
+	}
 	return nil
 }
 
-// scheduler handles the pattern of running functions either
-// concurrently or synchronously
+// scheduler handles the pattern of running functions either concurrently or
+// synchronously
 type scheduler struct {
-	pool     *concurrency.Pool
+	sem      *semaphore.Weighted
 	wg       *sync.WaitGroup
 	firstErr *atomic.Pointer[error] // holds the first error encountered during execution
 	cancel   func()
 }
 
-func newScheduler(pool *concurrency.Pool, wg *sync.WaitGroup, firstErr *atomic.Pointer[error], cancel func()) *scheduler {
+func newScheduler(sem *semaphore.Weighted, wg *sync.WaitGroup, firstErr *atomic.Pointer[error], cancel func()) *scheduler {
 	return &scheduler{
-		pool:     pool,
+		sem:      sem,
 		wg:       wg,
 		firstErr: firstErr,
 		cancel:   cancel,
@@ -449,11 +446,11 @@ func newScheduler(pool *concurrency.Pool, wg *sync.WaitGroup, firstErr *atomic.P
 // cleanup is called in the defer of the goroutine (for concurrent execution) or
 // after sync execution.
 func (s *scheduler) execute(fn func() error, cleanup func()) error {
-	if s.pool.TryAcquire() {
+	if s.sem.TryAcquire(1) {
 		s.wg.Add(1)
 		go func() {
 			defer func() {
-				s.pool.Release()
+				s.sem.Release(1)
 				s.wg.Done()
 				if cleanup != nil {
 					cleanup()
