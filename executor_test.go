@@ -916,7 +916,7 @@ func TestValidateArtifact(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer)
-			executor.MaxConcurrency = 0
+			executor.concurrency = 1
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateArtifact() error = %v, wantErr %v", err, tt.wantErr)
@@ -1237,7 +1237,7 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 	tests := []struct {
 		name           string
-		maxConcurrency int64
+		maxConcurrency int
 		opts           ValidateArtifactOptions
 		store          Store
 		verifiers      []Verifier
@@ -1495,7 +1495,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create executor: %v", err)
 			}
-			executor.MaxConcurrency = tt.maxConcurrency
+			executor.concurrency = tt.maxConcurrency
 
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
@@ -1507,8 +1507,8 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			}
 
 			// Verify that the executor was configured with the correct concurrency
-			if executor.MaxConcurrency != tt.maxConcurrency {
-				t.Errorf("Expected MaxConcurrency = %d, got %d", tt.maxConcurrency, executor.MaxConcurrency)
+			if executor.concurrency != tt.maxConcurrency {
+				t.Errorf("Expected MaxConcurrency = %d, got %d", tt.maxConcurrency, executor.concurrency)
 			}
 		})
 	}
@@ -1551,7 +1551,7 @@ func TestValidateArtifact_ConcurrentRaceConditions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
-	executor.MaxConcurrency = 4 // Set a reasonable concurrency limit for the test
+	executor.concurrency = 4 // Set a reasonable concurrency limit for the test
 
 	opts := ValidateArtifactOptions{
 		Subject: testImage,

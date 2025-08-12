@@ -28,6 +28,7 @@ import (
 	"oras.land/oras-go/v2/registry"
 )
 
+// defaultConcurrency is the default value of [Executor.concurrency]
 const defaultConcurrency = 3
 
 // errSubjectPruned is returned when the evaluator does not need given subject
@@ -75,10 +76,10 @@ type Executor struct {
 	// Optional.
 	PolicyEnforcer PolicyEnforcer
 
-	// MaxConcurrency is the maximum number of goroutines that can be created
-	// for each artifact validation request. The default value is 3 if not set.
-	// Optional.
-	MaxConcurrency int64
+	// concurrency limits the maximum number of concurrent execution per
+	// validation request. If less than or equal to 0, a default (currently 3)
+	// is used.
+	concurrency int
 }
 
 // NewExecutor creates a new executor with the given verifiers, store, and
@@ -92,13 +93,13 @@ func NewExecutor(store Store, verifiers []Verifier, policyEnforcer PolicyEnforce
 		Store:          store,
 		Verifiers:      verifiers,
 		PolicyEnforcer: policyEnforcer,
-		MaxConcurrency: defaultConcurrency,
+		concurrency:    defaultConcurrency,
 	}, nil
 }
 
 // ValidateArtifact returns the result of verifying an artifact.
 func (e *Executor) ValidateArtifact(ctx context.Context, opts ValidateArtifactOptions) (*ValidationResult, error) {
-	if err := validateExecutorSetup(e.Store, e.Verifiers, e.MaxConcurrency); err != nil {
+	if err := validateExecutorSetup(e.Store, e.Verifiers, e.concurrency); err != nil {
 		return nil, err
 	}
 
@@ -160,34 +161,36 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 
 	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
-	sem := semaphore.NewWeighted(e.MaxConcurrency)
+	sem := semaphore.NewWeighted(int64(e.concurrency) - 1)
 	sched := newScheduler(sem, &wg, &firstErr, cancel)
 
 	manager := newWorkerManager()
 	manager.pushTask(task)
-LOOP:
-	for {
-		task, ok := manager.popTask()
-		if !ok {
-			// No more tasks to process, break the loop.
-			break LOOP
-		}
 
-		select {
-		case <-childCtx.Done():
-			manager.cleanup()
-			break LOOP
-		default:
-		}
+	func() {
+		for {
+			task, ok := manager.popTask()
+			if !ok {
+				// No more tasks to process, break the loop.
+				return
+			}
 
-		if err := sched.execute(func() error {
-			return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, sem, manager)
-		}, manager.cleanup); err != nil {
-			// Handle synchronous execution error
-			firstErr.CompareAndSwap(nil, &err)
-			break LOOP
+			select {
+			case <-childCtx.Done():
+				manager.cleanup()
+				return
+			default:
+			}
+
+			if err := sched.execute(func() error {
+				return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, sem, manager)
+			}, manager.cleanup); err != nil {
+				// Handle synchronous execution error
+				firstErr.CompareAndSwap(nil, &err)
+				return
+			}
 		}
-	}
+	}()
 
 	if err := waitWithContext(childCtx, &wg); err != nil {
 		// Context was cancelled, return early
@@ -410,7 +413,7 @@ type executorTask struct {
 	subjectReport *ValidationReport
 }
 
-func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int64) error {
+func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int) error {
 	if store == nil {
 		return fmt.Errorf("store must be configured")
 	}
@@ -463,20 +466,19 @@ func (s *scheduler) execute(fn func() error, cleanup func()) error {
 			}
 		}()
 		return nil
-	} else {
-		defer func() {
-			if cleanup != nil {
-				cleanup()
-			}
-		}()
-
-		if err := fn(); err != nil {
-			s.firstErr.CompareAndSwap(nil, &err)
-			s.cancel()
-			return err
-		}
-		return nil
 	}
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+
+	if err := fn(); err != nil {
+		s.firstErr.CompareAndSwap(nil, &err)
+		s.cancel()
+		return err
+	}
+	return nil
 }
 
 // workerManager manages the worker pool and task stack for concurrent execution.
@@ -499,9 +501,7 @@ func newWorkerManager() *workerManager {
 // popTask atomically pops a task from the stack and increments active workers.
 func (m *workerManager) popTask() (*executorTask, bool) {
 	m.mu.Lock()
-	defer func() {
-		m.mu.Unlock()
-	}()
+	defer m.mu.Unlock()
 
 	// Wait for a task to be available or for the manager to be closed
 	for m.taskStack.Len() == 0 && !m.closed {
@@ -519,9 +519,7 @@ func (m *workerManager) popTask() (*executorTask, bool) {
 // pushTask pushes a task and signals waiting goroutines.
 func (m *workerManager) pushTask(task *executorTask) {
 	m.mu.Lock()
-	defer func() {
-		m.mu.Unlock()
-	}()
+	defer m.mu.Unlock()
 
 	if m.closed {
 		return
@@ -534,9 +532,7 @@ func (m *workerManager) pushTask(task *executorTask) {
 // cleanup atomically decrements active workers and closes stack if needed.
 func (m *workerManager) cleanup() {
 	m.mu.Lock()
-	defer func() {
-		m.mu.Unlock()
-	}()
+	defer m.mu.Unlock()
 
 	m.activeWorkers--
 	if m.taskStack.Len() == 0 && m.activeWorkers == 0 && !m.closed {
