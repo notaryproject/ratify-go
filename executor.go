@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 
 	"github.com/notaryproject/ratify-go/internal/stack"
+	ratiSync "github.com/notaryproject/ratify-go/internal/sync"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/semaphore"
 	"oras.land/oras-go/v2/registry"
@@ -76,10 +77,10 @@ type Executor struct {
 	// Optional.
 	PolicyEnforcer PolicyEnforcer
 
-	// concurrency limits the maximum number of concurrent execution per
+	// Concurrency limits the maximum number of concurrent execution per
 	// validation request. If less than or equal to 0, a default (currently 3)
 	// is used.
-	concurrency int
+	Concurrency int
 }
 
 // NewExecutor creates a new executor with the given verifiers, store, and
@@ -93,13 +94,13 @@ func NewExecutor(store Store, verifiers []Verifier, policyEnforcer PolicyEnforce
 		Store:          store,
 		Verifiers:      verifiers,
 		PolicyEnforcer: policyEnforcer,
-		concurrency:    defaultConcurrency,
+		Concurrency:    defaultConcurrency,
 	}, nil
 }
 
 // ValidateArtifact returns the result of verifying an artifact.
 func (e *Executor) ValidateArtifact(ctx context.Context, opts ValidateArtifactOptions) (*ValidationResult, error) {
-	if err := validateExecutorSetup(e.Store, e.Verifiers, e.concurrency); err != nil {
+	if err := validateExecutorSetup(e.Store, e.Verifiers, e.Concurrency); err != nil {
 		return nil, err
 	}
 
@@ -161,7 +162,7 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 
 	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
-	sem := semaphore.NewWeighted(int64(e.concurrency) - 1)
+	sem := semaphore.NewWeighted(int64(e.Concurrency) - 1)
 	sched := newScheduler(sem, &wg, &firstErr, cancel)
 
 	manager := newWorkerManager()
@@ -192,10 +193,10 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 		}
 	}()
 
-	if err := waitWithContext(childCtx, &wg); err != nil {
-		// Context was cancelled, return early
-		return nil, nil, err
-	}
+	// if err := waitWithContext(childCtx, &wg); err != nil {
+	// 	// Context was cancelled, return early
+	// 	return nil, nil, err
+	// }
 	if err := firstErr.Load(); err != nil {
 		return nil, nil, *err
 	}
@@ -206,7 +207,7 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 // referrers in the store and produces new tasks for each referrer.
 func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, sem *semaphore.Weighted, manager *workerManager) error {
 	artifact := task.artifact.String()
-	addArtifactReport, getArtifactReports := createThreadSafeCollector[*ValidationReport]()
+	artifactReportCollector := ratiSync.NewSlice[*ValidationReport]()
 	err := e.Store.ListReferrers(ctx, artifact, referenceTypes, func(referrers []ocispec.Descriptor) error {
 		childCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -223,7 +224,7 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 			}
 
 			if err := sched.execute(func() error {
-				return e.processReferrer(childCtx, task, repo, evaluator, referrer, artifact, sem, manager, addArtifactReport)
+				return e.processReferrer(childCtx, task, repo, evaluator, referrer, artifact, sem, manager, artifactReportCollector.Add)
 			}, nil); err != nil {
 				// Handle synchronous execution error
 				firstErr.CompareAndSwap(nil, &err)
@@ -250,7 +251,7 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 			return fmt.Errorf("failed to commit the artifact %s: %w", artifact, err)
 		}
 	}
-	task.subjectReport.ArtifactReports = append(task.subjectReport.ArtifactReports, getArtifactReports()...)
+	task.subjectReport.ArtifactReports = append(task.subjectReport.ArtifactReports, artifactReportCollector.Get()...)
 
 	return nil
 }
@@ -301,12 +302,12 @@ func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc,
 	var wg sync.WaitGroup
 	var firstErr atomic.Pointer[error]
 	sched := newScheduler(sem, &wg, &firstErr, cancel)
-	addVerifierReports, getVerifierReports := createThreadSafeCollector[*VerificationResult]()
+	verifierReportCollector := ratiSync.NewSlice[*VerificationResult]()
 
 	for _, verifier := range e.Verifiers {
 		select {
 		case <-childCtx.Done():
-			return getVerifierReports(), childCtx.Err()
+			return verifierReportCollector.Get(), childCtx.Err()
 		default:
 		}
 
@@ -315,7 +316,7 @@ func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc,
 		}
 
 		if err := sched.execute(func() error {
-			return e.processVerifier(childCtx, subjectDesc, repo, artifact, verifier, evaluator, addVerifierReports)
+			return e.processVerifier(childCtx, subjectDesc, repo, artifact, verifier, evaluator, verifierReportCollector.Add)
 		}, nil); err != nil {
 			// Handle synchronous execution error
 			firstErr.CompareAndSwap(nil, &err)
@@ -325,18 +326,18 @@ func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc,
 
 	if err := waitWithContext(childCtx, &wg); err != nil {
 		// Context was cancelled, return early
-		return getVerifierReports(), err
+		return verifierReportCollector.Get(), err
 	}
 	if err := firstErr.Load(); err != nil {
-		return getVerifierReports(), *err
+		return verifierReportCollector.Get(), *err
 	}
 
-	return getVerifierReports(), nil
+	return verifierReportCollector.Get(), nil
 }
 
 // processVerifier processes a single verifier, verifies the subject against
 // the artifact, and adds the report to the evaluator if available.
-func (e *Executor) processVerifier(ctx context.Context, subjectDesc ocispec.Descriptor, repo string, artifact ocispec.Descriptor, verifier Verifier, evaluator Evaluator, addVerifierReports func(report *VerificationResult)) error {
+func (e *Executor) processVerifier(ctx context.Context, subjectDesc ocispec.Descriptor, repo string, artifact ocispec.Descriptor, verifier Verifier, evaluator Evaluator, addVerifierReport func(report *VerificationResult)) error {
 	if evaluator != nil {
 		prunedState, err := evaluator.Pruned(ctx, subjectDesc.Digest.String(), artifact.Digest.String(), verifier.Name())
 		if err != nil {
@@ -380,7 +381,7 @@ func (e *Executor) processVerifier(ctx context.Context, subjectDesc ocispec.Desc
 			return fmt.Errorf("failed to add verifier report for artifact %s@%s verified by verifier %s: %w", repo, subjectDesc.Digest, verifier.Name(), err)
 		}
 	}
-	addVerifierReports(verifierReport)
+	addVerifierReport(verifierReport)
 	return nil
 }
 
@@ -485,7 +486,7 @@ func (s *scheduler) execute(fn func() error, cleanup func()) error {
 type workerManager struct {
 	mu            sync.Mutex
 	cond          *sync.Cond
-	activeWorkers int64
+	activeWorkers int
 	taskStack     *stack.Stack[*executorTask]
 	closed        bool
 }
@@ -539,30 +540,6 @@ func (m *workerManager) cleanup() {
 		m.closed = true
 		m.cond.Broadcast()
 	}
-}
-
-// createThreadSafeCollector creates a thread-safe function to collect items of
-// type T and returns the collector function and a function to get the collected
-// items.
-func createThreadSafeCollector[T any]() (func(T), func() []T) {
-	var items []T
-	var mu sync.Mutex
-
-	addItem := func(item T) {
-		mu.Lock()
-		defer mu.Unlock()
-		items = append(items, item)
-	}
-
-	getItems := func() []T {
-		mu.Lock()
-		defer mu.Unlock()
-		result := make([]T, len(items))
-		copy(result, items)
-		return result
-	}
-
-	return addItem, getItems
 }
 
 // waitWithContext waits for either the WaitGroup to complete or the context to

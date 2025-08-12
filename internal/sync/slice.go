@@ -1,0 +1,47 @@
+/*
+Copyright The Ratify Authors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package sync
+
+import "sync"
+
+// Slice is a thread-safe collector for items of type T.
+type Slice[T any] struct {
+	items []T
+	mu    sync.Mutex
+}
+
+// NewSlice creates a new thread-safe slice collector.
+func NewSlice[T any]() *Slice[T] {
+	return &Slice[T]{
+		items: make([]T, 0),
+	}
+}
+
+// Add adds an item to the slice in a thread-safe manner.
+func (s *Slice[T]) Add(item T) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items = append(s.items, item)
+}
+
+// Get returns a copy of all collected items in a thread-safe manner.
+func (s *Slice[T]) Get() []T {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]T, len(s.items))
+	copy(result, s.items)
+	return result
+}
