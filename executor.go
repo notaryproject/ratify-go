@@ -22,7 +22,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/notaryproject/ratify-go/internal/stack"
 	ratiSync "github.com/notaryproject/ratify-go/internal/sync"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/semaphore"
@@ -161,42 +160,59 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 	defer cancel()
 
 	var firstErr atomic.Pointer[error]
-	var wg sync.WaitGroup
 	sem := semaphore.NewWeighted(int64(e.Concurrency) - 1)
-	sched := newScheduler(sem, &wg, &firstErr, cancel)
 
-	manager := newWorkerManager()
-	manager.pushTask(task)
+	stack := ratiSync.NewStack[*executorTask]()
+	stack.Push(task)
+	activeWorkers := 0
+	workerChan := make(chan struct{})
 
 	func() {
 		for {
-			task, ok := manager.popTask()
-			if !ok {
-				// No more tasks to process, break the loop.
-				return
-			}
-
+			// Increment activeWorkers just before attempting to pop
+			activeWorkers++
 			select {
 			case <-childCtx.Done():
-				manager.cleanup()
+				activeWorkers-- // Decrement since we didn't actually pop
+				stack.Close()
 				return
-			default:
-			}
-
-			if err := sched.execute(func() error {
-				return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, sem, manager)
-			}, manager.cleanup); err != nil {
-				// Handle synchronous execution error
-				firstErr.CompareAndSwap(nil, &err)
-				return
+			case <-workerChan:
+				activeWorkers -= 2 // Decrement by 2 since we incremented by 1 before the select as well
+				if activeWorkers == 0 && stack.IsEmpty() {
+					stack.Close()
+					return
+				}
+			case task := <-stack.Pop():
+				// Process the task here
+				t := task
+				if sem.TryAcquire(1) {
+					go func() {
+						defer func() {
+							sem.Release(1)
+							workerChan <- struct{}{}
+						}()
+						if err := e.verifySubjectAgainstReferrers(childCtx, t, repo, referenceTypes, evaluator, sem, stack); err != nil {
+							firstErr.CompareAndSwap(nil, &err)
+							cancel()
+							return
+						}
+					}()
+					continue
+				}
+				if err := e.verifySubjectAgainstReferrers(childCtx, t, repo, referenceTypes, evaluator, sem, stack); err != nil {
+					firstErr.CompareAndSwap(nil, &err)
+					cancel()
+					return
+				}
+				activeWorkers--
+				if activeWorkers == 0 && stack.IsEmpty() {
+					stack.Close()
+					return
+				}
 			}
 		}
 	}()
 
-	// if err := waitWithContext(childCtx, &wg); err != nil {
-	// 	// Context was cancelled, return early
-	// 	return nil, nil, err
-	// }
 	if err := firstErr.Load(); err != nil {
 		return nil, nil, *err
 	}
@@ -205,9 +221,9 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 
 // verifySubjectAgainstReferrers verifies the subject artifact against all
 // referrers in the store and produces new tasks for each referrer.
-func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, sem *semaphore.Weighted, manager *workerManager) error {
+func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, sem *semaphore.Weighted, stack *ratiSync.Stack[*executorTask]) error {
 	artifact := task.artifact.String()
-	artifactReportCollector := ratiSync.NewSlice[*ValidationReport]()
+	artifactReports := ratiSync.NewSlice[*ValidationReport]()
 	err := e.Store.ListReferrers(ctx, artifact, referenceTypes, func(referrers []ocispec.Descriptor) error {
 		childCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -224,7 +240,7 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 			}
 
 			if err := sched.execute(func() error {
-				return e.processReferrer(childCtx, task, repo, evaluator, referrer, artifact, sem, manager, artifactReportCollector.Add)
+				return e.processReferrer(childCtx, task, repo, evaluator, referrer, artifact, sem, stack, artifactReports)
 			}, nil); err != nil {
 				// Handle synchronous execution error
 				firstErr.CompareAndSwap(nil, &err)
@@ -251,14 +267,14 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 			return fmt.Errorf("failed to commit the artifact %s: %w", artifact, err)
 		}
 	}
-	task.subjectReport.ArtifactReports = append(task.subjectReport.ArtifactReports, artifactReportCollector.Get()...)
+	task.subjectReport.ArtifactReports = append(task.subjectReport.ArtifactReports, artifactReports.Get()...)
 
 	return nil
 }
 
 // processReferrer processes a single referrer artifact, verifies it, and
 // creates a new task for it if necessary.
-func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, sem *semaphore.Weighted, manager *workerManager, addArtifactReport func(*ValidationReport)) error {
+func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo string, evaluator Evaluator, referrer ocispec.Descriptor, artifact string, sem *semaphore.Weighted, stack *ratiSync.Stack[*executorTask], artifactReports *ratiSync.Slice[*ValidationReport]) error {
 	results, err := e.verifyArtifact(ctx, repo, task.artifactDesc, referrer, evaluator, sem)
 	if err != nil {
 		if errors.Is(err, errSubjectPruned) && len(results) > 0 {
@@ -270,7 +286,7 @@ func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo
 				Results:  results,
 				Artifact: referrer,
 			}
-			addArtifactReport(artifactReport)
+			artifactReports.Add(artifactReport)
 		}
 		return err
 	}
@@ -280,7 +296,7 @@ func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo
 		Results:  results,
 		Artifact: referrer,
 	}
-	addArtifactReport(artifactReport)
+	artifactReports.Add(artifactReport)
 
 	referrerArtifact := task.artifact
 	referrerArtifact.Reference = referrer.Digest.String()
@@ -289,7 +305,7 @@ func (e *Executor) processReferrer(ctx context.Context, task *executorTask, repo
 		artifactDesc:  referrer,
 		subjectReport: artifactReport,
 	}
-	manager.pushTask(newTask)
+	stack.Push(newTask)
 	return nil
 }
 
@@ -302,12 +318,12 @@ func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc,
 	var wg sync.WaitGroup
 	var firstErr atomic.Pointer[error]
 	sched := newScheduler(sem, &wg, &firstErr, cancel)
-	verifierReportCollector := ratiSync.NewSlice[*VerificationResult]()
+	verificationResults := ratiSync.NewSlice[*VerificationResult]()
 
 	for _, verifier := range e.Verifiers {
 		select {
 		case <-childCtx.Done():
-			return verifierReportCollector.Get(), childCtx.Err()
+			return verificationResults.Get(), childCtx.Err()
 		default:
 		}
 
@@ -316,7 +332,7 @@ func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc,
 		}
 
 		if err := sched.execute(func() error {
-			return e.processVerifier(childCtx, subjectDesc, repo, artifact, verifier, evaluator, verifierReportCollector.Add)
+			return e.processVerifier(childCtx, subjectDesc, repo, artifact, verifier, evaluator, verificationResults)
 		}, nil); err != nil {
 			// Handle synchronous execution error
 			firstErr.CompareAndSwap(nil, &err)
@@ -326,18 +342,18 @@ func (e *Executor) verifyArtifact(ctx context.Context, repo string, subjectDesc,
 
 	if err := waitWithContext(childCtx, &wg); err != nil {
 		// Context was cancelled, return early
-		return verifierReportCollector.Get(), err
+		return verificationResults.Get(), err
 	}
 	if err := firstErr.Load(); err != nil {
-		return verifierReportCollector.Get(), *err
+		return verificationResults.Get(), *err
 	}
 
-	return verifierReportCollector.Get(), nil
+	return verificationResults.Get(), nil
 }
 
 // processVerifier processes a single verifier, verifies the subject against
 // the artifact, and adds the report to the evaluator if available.
-func (e *Executor) processVerifier(ctx context.Context, subjectDesc ocispec.Descriptor, repo string, artifact ocispec.Descriptor, verifier Verifier, evaluator Evaluator, addVerifierReport func(report *VerificationResult)) error {
+func (e *Executor) processVerifier(ctx context.Context, subjectDesc ocispec.Descriptor, repo string, artifact ocispec.Descriptor, verifier Verifier, evaluator Evaluator, verificationResults *ratiSync.Slice[*VerificationResult]) error {
 	if evaluator != nil {
 		prunedState, err := evaluator.Pruned(ctx, subjectDesc.Digest.String(), artifact.Digest.String(), verifier.Name())
 		if err != nil {
@@ -381,7 +397,7 @@ func (e *Executor) processVerifier(ctx context.Context, subjectDesc ocispec.Desc
 			return fmt.Errorf("failed to add verifier report for artifact %s@%s verified by verifier %s: %w", repo, subjectDesc.Digest, verifier.Name(), err)
 		}
 	}
-	addVerifierReport(verifierReport)
+	verificationResults.Add(verifierReport)
 	return nil
 }
 
@@ -399,7 +415,7 @@ func (e *Executor) resolveSubject(ctx context.Context, subject string) (registry
 	return ref, artifactDesc, nil
 }
 
-// executorTask is a struct that represents a executorTask that verifies an artifact by
+// executorTask is a struct that represents a task that verifies an artifact by
 // the executor.
 type executorTask struct {
 	// artifact is the digested reference of the referrer artifact that will be
@@ -422,7 +438,7 @@ func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int) e
 		return fmt.Errorf("at least one verifier must be configured")
 	}
 	if concurrency < 0 {
-		return fmt.Errorf("maxConcurrency must be greater than or equal to 0, got %d", concurrency)
+		return fmt.Errorf("concurrency must be greater than or equal to 0, got %d", concurrency)
 	}
 	return nil
 }
@@ -480,66 +496,6 @@ func (s *scheduler) execute(fn func() error, cleanup func()) error {
 		return err
 	}
 	return nil
-}
-
-// workerManager manages the worker pool and task stack for concurrent execution.
-type workerManager struct {
-	mu            sync.Mutex
-	cond          *sync.Cond
-	activeWorkers int
-	taskStack     *stack.Stack[*executorTask]
-	closed        bool
-}
-
-func newWorkerManager() *workerManager {
-	m := &workerManager{
-		taskStack: &stack.Stack[*executorTask]{},
-	}
-	m.cond = sync.NewCond(&m.mu)
-	return m
-}
-
-// popTask atomically pops a task from the stack and increments active workers.
-func (m *workerManager) popTask() (*executorTask, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Wait for a task to be available or for the manager to be closed
-	for m.taskStack.Len() == 0 && !m.closed {
-		m.cond.Wait()
-	}
-
-	// Check if we're closed and no more tasks
-	if m.closed && m.taskStack.Len() == 0 {
-		return nil, false
-	}
-	m.activeWorkers++
-	return m.taskStack.Pop(), true
-}
-
-// pushTask pushes a task and signals waiting goroutines.
-func (m *workerManager) pushTask(task *executorTask) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.closed {
-		return
-	}
-
-	m.taskStack.Push(task)
-	m.cond.Signal()
-}
-
-// cleanup atomically decrements active workers and closes stack if needed.
-func (m *workerManager) cleanup() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.activeWorkers--
-	if m.taskStack.Len() == 0 && m.activeWorkers == 0 && !m.closed {
-		m.closed = true
-		m.cond.Broadcast()
-	}
 }
 
 // waitWithContext waits for either the WaitGroup to complete or the context to
