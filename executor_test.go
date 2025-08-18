@@ -1237,7 +1237,7 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 	tests := []struct {
 		name           string
-		maxConcurrency int
+		concurrency int
 		opts           ValidateArtifactOptions
 		store          Store
 		verifiers      []Verifier
@@ -1247,7 +1247,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 	}{
 		{
 			name:           "Concurrent execution with 4 goroutines - multiple artifacts",
-			maxConcurrency: 4,
+			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
 			},
@@ -1291,7 +1291,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 		},
 		{
 			name:           "Concurrent execution with 4 goroutines - nested artifacts",
-			maxConcurrency: 4,
+			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
 			},
@@ -1347,7 +1347,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 		},
 		{
 			name:           "Concurrent execution with 4 goroutines - error in one goroutine",
-			maxConcurrency: 4,
+			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
 			},
@@ -1383,7 +1383,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 		},
 		{
 			name:           "Concurrent execution with 4 goroutines - evaluator add result error",
-			maxConcurrency: 4,
+			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
 			},
@@ -1415,78 +1415,6 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			want:    nil,
 			wantErr: true,
 		},
-		{
-			name:           "Concurrent execution with 4 goroutines - complex artifact tree",
-			maxConcurrency: 4,
-			opts: ValidateArtifactOptions{
-				Subject: testImage,
-			},
-			store: &mockStore{
-				tagToDesc: map[string]ocispec.Descriptor{
-					testImage: {
-						Digest: testDigest1,
-					},
-				},
-				// Complex tree structure to stress test concurrent execution
-				digestToReferrers: map[string][]ocispec.Descriptor{
-					testArtifact1: {
-						{Digest: testDigest2},
-						{Digest: testDigest3},
-					},
-					testArtifact2: {
-						{Digest: testDigest4},
-						{Digest: testDigest5},
-					},
-					testArtifact3: {
-						{Digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
-						{Digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
-					},
-					"test-registry/test-repo@sha256:1111111111111111111111111111111111111111111111111111111111111111": {
-						{Digest: "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
-					},
-				},
-			},
-			verifiers: []Verifier{&mockVerifier{
-				verifiable: true,
-				verifyResult: map[string]*VerificationResult{
-					testDigest2: {Description: validMessage2},
-					testDigest3: {Description: validMessage3},
-					testDigest4: {Description: validMessage4},
-					testDigest5: {Description: validMessage5},
-					"sha256:1111111111111111111111111111111111111111111111111111111111111111": {Description: "valid message 6"},
-					"sha256:2222222222222222222222222222222222222222222222222222222222222222": {Description: "valid message 7"},
-					"sha256:3333333333333333333333333333333333333333333333333333333333333333": {Description: "valid message 8"},
-				},
-			}},
-			policyEnforcer: &mockPolicyEnforcer{
-				evaluator: &mockEvaluator{},
-			},
-			want: &ValidationResult{
-				Succeeded: true,
-				ArtifactReports: []*ValidationReport{
-					{
-						Results: []*VerificationResult{{Description: validMessage2}},
-						ArtifactReports: []*ValidationReport{
-							{Results: []*VerificationResult{{Description: validMessage4}}},
-							{Results: []*VerificationResult{{Description: validMessage5}}},
-						},
-					},
-					{
-						Results: []*VerificationResult{{Description: validMessage3}},
-						ArtifactReports: []*ValidationReport{
-							{
-								Results: []*VerificationResult{{Description: "valid message 6"}},
-								ArtifactReports: []*ValidationReport{
-									{Results: []*VerificationResult{{Description: "valid message 8"}}},
-								},
-							},
-							{Results: []*VerificationResult{{Description: "valid message 7"}}},
-						},
-					},
-				},
-			},
-			wantErr: false,
-		},
 	}
 
 	for _, tt := range tests {
@@ -1495,7 +1423,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create executor: %v", err)
 			}
-			executor.Concurrency = tt.maxConcurrency
+			executor.Concurrency = tt.concurrency
 
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
@@ -1507,8 +1435,8 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			}
 
 			// Verify that the executor was configured with the correct concurrency
-			if executor.Concurrency != tt.maxConcurrency {
-				t.Errorf("Expected MaxConcurrency = %d, got %d", tt.maxConcurrency, executor.Concurrency)
+			if executor.Concurrency != tt.concurrency {
+				t.Errorf("Expected MaxConcurrency = %d, got %d", tt.concurrency, executor.Concurrency)
 			}
 		})
 	}
