@@ -24,7 +24,11 @@ func (s *Stack[T]) Push(keys ...T) {
 }
 
 // Pop pops keys from the stack.
+// Panics if the stack is empty.
 func (s *Stack[T]) Pop() T {
+	if len(*s) == 0 {
+		panic("pop from empty stack")
+	}
 	t := (*s)[len(*s)-1]
 	*s = (*s)[:len(*s)-1]
 	return t
