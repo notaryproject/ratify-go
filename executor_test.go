@@ -1237,7 +1237,7 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 	tests := []struct {
 		name           string
-		concurrency int
+		concurrency    int
 		opts           ValidateArtifactOptions
 		store          Store
 		verifiers      []Verifier
@@ -1246,7 +1246,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 		wantErr        bool
 	}{
 		{
-			name:           "Concurrent execution with 4 goroutines - multiple artifacts",
+			name:        "Concurrent execution with 4 goroutines - multiple artifacts",
 			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
@@ -1290,7 +1290,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:           "Concurrent execution with 4 goroutines - nested artifacts",
+			name:        "Concurrent execution with 4 goroutines - nested artifacts",
 			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
@@ -1346,7 +1346,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:           "Concurrent execution with 4 goroutines - error in one goroutine",
+			name:        "Concurrent execution with 4 goroutines - error in one goroutine",
 			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,
@@ -1382,7 +1382,7 @@ func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:           "Concurrent execution with 4 goroutines - evaluator add result error",
+			name:        "Concurrent execution with 4 goroutines - evaluator add result error",
 			concurrency: 4,
 			opts: ValidateArtifactOptions{
 				Subject: testImage,

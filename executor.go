@@ -160,59 +160,40 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 	defer cancel()
 
 	var firstErr atomic.Pointer[error]
+	var wg sync.WaitGroup
 	sem := semaphore.NewWeighted(int64(e.Concurrency) - 1)
-
+	sched := newScheduler(sem, &wg, &firstErr, cancel)
 	stack := ratiSync.NewStack[*executorTask]()
 	stack.Push(task)
-	activeWorkers := 0
-	workerChan := make(chan struct{})
 
 	func() {
 		for {
-			// Increment activeWorkers just before attempting to pop
-			activeWorkers++
+			task, ok := stack.Pop()
+			if !ok {
+				// No more tasks to process, break the loop.
+				return
+			}
+
 			select {
 			case <-childCtx.Done():
-				activeWorkers-- // Decrement since we didn't actually pop
-				stack.Close()
+				stack.Done()
 				return
-			case <-workerChan:
-				activeWorkers -= 2 // Decrement by 2 since we incremented by 1 before the select as well
-				if activeWorkers == 0 && stack.IsEmpty() {
-					stack.Close()
-					return
-				}
-			case task := <-stack.Pop():
-				// Process the task here
-				t := task
-				if sem.TryAcquire(1) {
-					go func() {
-						defer func() {
-							sem.Release(1)
-							workerChan <- struct{}{}
-						}()
-						if err := e.verifySubjectAgainstReferrers(childCtx, t, repo, referenceTypes, evaluator, sem, stack); err != nil {
-							firstErr.CompareAndSwap(nil, &err)
-							cancel()
-							return
-						}
-					}()
-					continue
-				}
-				if err := e.verifySubjectAgainstReferrers(childCtx, t, repo, referenceTypes, evaluator, sem, stack); err != nil {
-					firstErr.CompareAndSwap(nil, &err)
-					cancel()
-					return
-				}
-				activeWorkers--
-				if activeWorkers == 0 && stack.IsEmpty() {
-					stack.Close()
-					return
-				}
+			default:
+			}
+
+			if err := sched.execute(func() error {
+				return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, sem, stack)
+			}, stack.Done); err != nil {
+				// Handle synchronous execution error
+				firstErr.CompareAndSwap(nil, &err)
+				return
 			}
 		}
 	}()
 
+	if err := waitWithContext(childCtx, &wg); err != nil {
+		return nil, nil, err
+	}
 	if err := firstErr.Load(); err != nil {
 		return nil, nil, *err
 	}
@@ -267,6 +248,8 @@ func (e *Executor) verifySubjectAgainstReferrers(ctx context.Context, task *exec
 			return fmt.Errorf("failed to commit the artifact %s: %w", artifact, err)
 		}
 	}
+	task.mu.Lock()
+	defer task.mu.Unlock()
 	task.subjectReport.ArtifactReports = append(task.subjectReport.ArtifactReports, artifactReports.Get()...)
 
 	return nil
@@ -428,6 +411,8 @@ type executorTask struct {
 
 	// subjectReport is the report of the subject artifact.
 	subjectReport *ValidationReport
+
+	mu sync.Mutex
 }
 
 func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int) error {

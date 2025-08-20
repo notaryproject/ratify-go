@@ -17,99 +17,73 @@ package sync
 
 import (
 	"sync"
+
+	"github.com/notaryproject/ratify-go/internal/stack"
 )
 
 // Stack represents a concurrency-safe stack implementation.
-// Push operations are non-blocking and directly send to waiting pop operations
-// if available.
-// Pop operations can be blocking and return a channel.
-// This implementation uses waiters for immediate delivery and an items slice 
-// for storage.
+// It wraps up a standard stack and provides additional synchronization 
+// primitives.
+// It makes accessing the underlying stack and activeWorkers as atomic.
+// Push operations are non-blocking and directly add items to the stack.
+// Pop operations are blocking and use sync.Cond to wait for items.
 type Stack[T any] struct {
-	mu      sync.Mutex
-	items   []T
-	waiters []chan T
+	mu            sync.Mutex
+	cond          *sync.Cond
+	activeWorkers int
+	stack         *stack.Stack[T]
+	closed        bool
 }
 
 // NewStack creates a new concurrency-safe stack.
 func NewStack[T any]() *Stack[T] {
-	return &Stack[T]{
-		items:   make([]T, 0),
-		waiters: make([]chan T, 0),
+	s := &Stack[T]{
+		stack: &stack.Stack[T]{},
 	}
+	s.cond = sync.NewCond(&s.mu)
+	return s
 }
 
-// Push adds an item to the stack. This operation is completely non-blocking.
-// If there are waiting pop operations, the item is sent directly to one of them.
-// If no waiters are available, the item is stored in the items slice.
+// Push adds an item to the stack. This operation is non-blocking.
 func (s *Stack[T]) Push(item T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If there are waiters, send the item to the most recent waiter (LIFO)
-	if len(s.waiters) > 0 {
-		// Get the last waiter (most recent)
-		waiter := s.waiters[len(s.waiters)-1]
-		s.waiters = s.waiters[:len(s.waiters)-1]
-
-		// Send the item to the waiter (non-blocking since channel is buffered)
-		select {
-		case waiter <- item:
-			// Successfully sent
-		default:
-			// Defensive: This case should not occur because resultCh is a 
-			// buffered channel of size 1, and we only send one value before
-			// returning. If this ever happens, we store the item to ensure 
-			// non-blocking behavior.
-			s.items = append(s.items, item)
-		}
+	if s.closed {
 		return
 	}
-
-	// No waiters available, store the item in the slice
-	s.items = append(s.items, item)
+	s.stack.Push(item)
+	s.cond.Signal()
 }
 
-// Pop removes and returns an item from the stack through a channel.
-// This operation can be blocking if the stack is empty.
-func (s *Stack[T]) Pop() <-chan T {
+// Pop removes and returns an item from the stack. This operation is blocking.
+// It returns (item, true) if an item was successfully popped, or (zero, false)
+// if the stack is closed.
+func (s *Stack[T]) Pop() (T, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Create a buffered channel for the result
-	resultCh := make(chan T, 1)
-
-	// If there are stored items, return the most recent one immediately (LIFO)
-	if len(s.items) > 0 {
-		item := s.items[len(s.items)-1]
-		s.items = s.items[:len(s.items)-1]
-		resultCh <- item
-		return resultCh
+	for s.stack.Len() == 0 && !s.closed {
+		s.cond.Wait()
 	}
 
-	// No stored items, add this pop operation to the waiters
-	s.waiters = append(s.waiters, resultCh)
-
-	return resultCh
-}
-
-// IsEmpty returns true if the stack is empty.
-func (s *Stack[T]) IsEmpty() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return len(s.items) == 0
-}
-
-// Close closes the stack and signals all waiting operations.
-func (s *Stack[T]) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Close all waiting channels
-	for _, waiter := range s.waiters {
-		close(waiter)
+	if s.closed && s.stack.Len() == 0 {
+		var zero T
+		return zero, false
 	}
-	s.waiters = nil
-	s.items = nil
+	s.activeWorkers++
+	return s.stack.Pop(), true
+}
+
+// Done signals that an item has been processed and a worker is released.
+// If the stack is empty and no workers are active, the stack will be closed.
+func (s *Stack[T]) Done() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.activeWorkers--
+	if s.activeWorkers == 0 && !s.closed && s.stack.Len() == 0 {
+		s.closed = true
+		s.cond.Broadcast()
+	}
 }

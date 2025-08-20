@@ -21,278 +21,327 @@ import (
 	"time"
 )
 
-func TestStackPushPop(t *testing.T) {
-	stack := NewStack[string]()
-
-	// Test that pop blocks when stack is empty
-	popCh := stack.Pop()
-
-	// Push an item
-	go func() {
-		time.Sleep(10 * time.Millisecond) // Small delay
-		stack.Push("hello")
-	}()
-
-	// Pop should receive the item
-	select {
-	case item := <-popCh:
-		if item != "hello" {
-			t.Errorf("Expected 'hello', got '%s'", item)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Pop operation timed out")
-	}
-}
-
-func TestStackLIFO(t *testing.T) {
-	stack := NewStack[string]()
-
-	// Start two pop operations
-	pop1Ch := stack.Pop()
-	pop2Ch := stack.Pop()
-
-	// Push items - they should be received in LIFO order
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		stack.Push("first")
-		time.Sleep(10 * time.Millisecond)
-		stack.Push("second")
-	}()
-
-	// The most recent pop (pop2) should get the first push
-	// The earlier pop (pop1) should get the second push
-	var item1, item2 string
-	var received1, received2 bool
-
-	for i := 0; i < 2; i++ {
-		select {
-		case item := <-pop1Ch:
-			item1 = item
-			received1 = true
-		case item := <-pop2Ch:
-			item2 = item
-			received2 = true
-		case <-time.After(200 * time.Millisecond):
-			t.Error("Pop operation timed out")
-		}
-	}
-
-	if !received1 || !received2 {
-		t.Error("Not all pop operations completed")
-	}
-
-	// pop2 (more recent) should get "first", pop1 should get "second"
-	if item2 != "first" {
-		t.Errorf("Expected pop2 to get 'first', got '%s'", item2)
-	}
-	if item1 != "second" {
-		t.Errorf("Expected pop1 to get 'second', got '%s'", item1)
-	}
-}
-
-func TestStackConcurrency(t *testing.T) {
+func TestStack_NewStack(t *testing.T) {
 	stack := NewStack[int]()
-	const numGoroutines = 10
-	const itemsPerGoroutine = 100
+	if stack == nil {
+		t.Error("Expected NewStack to return a non-nil stack")
+	}
+	if stack.closed {
+		t.Error("Expected new stack to not be closed")
+	}
+	if stack.activeWorkers != 0 {
+		t.Error("Expected new stack to have 0 active workers")
+	}
+}
+
+func TestStack_Push(t *testing.T) {
+	stack := NewStack[int]()
+
+	// Test pushing to empty stack
+	stack.Push(1)
+	if stack.stack.Len() != 1 {
+		t.Errorf("Expected stack length to be 1, got %d", stack.stack.Len())
+	}
+
+	// Test pushing multiple items
+	stack.Push(2)
+	stack.Push(3)
+	if stack.stack.Len() != 3 {
+		t.Errorf("Expected stack length to be 3, got %d", stack.stack.Len())
+	}
+}
+
+func TestStack_Pop(t *testing.T) {
+	stack := NewStack[int]()
+
+	// Push some items
+	stack.Push(1)
+	stack.Push(2)
+	stack.Push(3)
+
+	// Pop items and verify LIFO order
+	item, ok := stack.Pop()
+	if !ok {
+		t.Error("Expected Pop to return true")
+	}
+	if item != 3 {
+		t.Errorf("Expected popped item to be 3, got %d", item)
+	}
+	if stack.activeWorkers != 1 {
+		t.Errorf("Expected activeWorkers to be 1, got %d", stack.activeWorkers)
+	}
+
+	item, ok = stack.Pop()
+	if !ok {
+		t.Error("Expected Pop to return true")
+	}
+	if item != 2 {
+		t.Errorf("Expected popped item to be 2, got %d", item)
+	}
+	if stack.activeWorkers != 2 {
+		t.Errorf("Expected activeWorkers to be 2, got %d", stack.activeWorkers)
+	}
+}
+
+func TestStack_Done(t *testing.T) {
+	stack := NewStack[int]()
+
+	// Push and pop an item
+	stack.Push(1)
+	_, ok := stack.Pop()
+	if !ok {
+		t.Error("Expected Pop to return true")
+	}
+
+	// Call Done to decrease active workers
+	stack.Done()
+	if stack.activeWorkers != 0 {
+		t.Errorf("Expected activeWorkers to be 0, got %d", stack.activeWorkers)
+	}
+}
+
+func TestStack_PopBlocking(t *testing.T) {
+	stack := NewStack[int]()
+
+	// Channel to coordinate goroutines
+	started := make(chan bool)
+	finished := make(chan bool)
+
+	// Start a goroutine that will block on Pop
+	go func() {
+		started <- true
+		item, ok := stack.Pop()
+		if !ok {
+			t.Error("Expected Pop to return true")
+			return
+		}
+		if item != 42 {
+			t.Errorf("Expected popped item to be 42, got %d", item)
+		}
+		finished <- true
+	}()
+
+	// Wait for goroutine to start
+	<-started
+
+	// Give some time to ensure Pop is blocking
+	time.Sleep(10 * time.Millisecond)
+
+	// Push an item to unblock Pop
+	stack.Push(42)
+
+	// Wait for goroutine to finish
+	select {
+	case <-finished:
+		// Success
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Pop did not unblock after Push")
+	}
+}
+
+func TestStack_ConcurrentPushPop(t *testing.T) {
+	stack := NewStack[int]()
+
+	const numItems = 100
 
 	var wg sync.WaitGroup
 
-	// Start pop operations
-	results := make([]chan int, numGoroutines*itemsPerGoroutine)
-	for i := 0; i < numGoroutines*itemsPerGoroutine; i++ {
-		results[i] = make(chan int, 1)
-		go func(index int) {
-			popCh := stack.Pop()
-			select {
-			case item := <-popCh:
-				results[index] <- item
-			case <-time.After(time.Second):
-				t.Errorf("Pop operation %d timed out", index)
-				results[index] <- -1
-			}
-		}(i)
-	}
+	// Start a producer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numItems; i++ {
+			stack.Push(i)
+		}
+	}()
 
-	// Push items
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(start int) {
-			defer wg.Done()
-			for j := 0; j < itemsPerGoroutine; j++ {
-				stack.Push(start*itemsPerGoroutine + j)
+	// Start a consumer
+	consumedItems := make([]int, 0, numItems)
+	var itemsMu sync.Mutex
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numItems; i++ {
+			item, ok := stack.Pop()
+			if !ok {
+				t.Error("Expected Pop to return true")
+				return
 			}
-		}(i)
-	}
+			itemsMu.Lock()
+			consumedItems = append(consumedItems, item)
+			itemsMu.Unlock()
+		}
+	}()
 
 	wg.Wait()
 
-	// Collect all results
-	received := make(map[int]bool)
-	for i := 0; i < numGoroutines*itemsPerGoroutine; i++ {
-		select {
-		case item := <-results[i]:
-			if item >= 0 {
-				received[item] = true
-			}
-		case <-time.After(100 * time.Millisecond):
-			t.Errorf("Result %d not received", i)
-		}
-	}
-
-	// Verify all items were received
-	expectedCount := numGoroutines * itemsPerGoroutine
-	if len(received) != expectedCount {
-		t.Errorf("Expected %d unique items, got %d", expectedCount, len(received))
+	// Verify all items were consumed
+	if len(consumedItems) != numItems {
+		t.Errorf("Expected %d items, got %d", numItems, len(consumedItems))
 	}
 }
 
-func TestStackPushNonBlocking(t *testing.T) {
+func TestStack_AutoClose(t *testing.T) {
 	stack := NewStack[int]()
 
-	// Test that push is non-blocking even when there are no waiters
-	done := make(chan bool, 1)
+	// Push an item
+	stack.Push(1)
 
-	go func() {
-		// These pushes should complete immediately even with no waiters
-		for i := 0; i < 1000; i++ {
-			stack.Push(i)
-		}
-		done <- true
-	}()
-
-	// Push operations should complete quickly
-	select {
-	case <-done:
-		// Success - push operations completed without blocking
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Push operations appeared to block, but they should be non-blocking")
+	// Pop the item
+	item, ok := stack.Pop()
+	if !ok {
+		t.Error("Expected Pop to return true")
+	}
+	if item != 1 {
+		t.Errorf("Expected popped item to be 1, got %d", item)
 	}
 
-	// Since there were no waiters, items should be stored in the stack
-	// Verify by checking that a subsequent pop operation returns the last item (LIFO)
-	popCh := stack.Pop()
-	select {
-	case item := <-popCh:
-		// Should get the last pushed item (999) due to LIFO behavior
-		if item != 999 {
-			t.Errorf("Expected to get the last pushed item (999), but got: %v", item)
-		}
-	case <-time.After(50 * time.Millisecond):
-		t.Error("Pop operation timed out, but items should be available")
+	// Call Done - this should close the stack since no items left and no active workers
+	stack.Done()
+
+	if !stack.closed {
+		t.Error("Expected stack to be closed after Done() with no items and no active workers")
 	}
 }
 
-func TestStackIsEmpty(t *testing.T) {
+func TestStack_PopFromClosedStack(t *testing.T) {
 	stack := NewStack[int]()
 
-	// IsEmpty should always return true in this implementation
-	if !stack.IsEmpty() {
-		t.Error("Expected stack to be empty")
+	// Close the stack by pushing, popping, and calling Done
+	stack.Push(1)
+	_, ok := stack.Pop()
+	if !ok {
+		t.Error("Expected Pop to return true")
+	}
+	stack.Done()
+
+	// Try to pop from closed stack
+	_, ok = stack.Pop()
+	if ok {
+		t.Error("Expected Pop from closed stack to return false")
 	}
 }
 
-func TestStackClose(t *testing.T) {
+func TestStack_PushToClosedStack(t *testing.T) {
 	stack := NewStack[int]()
-
-	// Start some pop operations
-	pop1 := stack.Pop()
-	pop2 := stack.Pop()
 
 	// Close the stack
-	stack.Close()
-
-	// Channels should be closed
-	select {
-	case _, ok := <-pop1:
-		if ok {
-			t.Error("Expected channel to be closed")
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Channel close not detected")
+	stack.Push(1)
+	_, ok := stack.Pop()
+	if !ok {
+		t.Error("Expected Pop to return true")
 	}
+	stack.Done()
 
-	select {
-	case _, ok := <-pop2:
-		if ok {
-			t.Error("Expected channel to be closed")
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Channel close not detected")
+	initialLen := stack.stack.Len()
+
+	// Try to push to closed stack
+	stack.Push(2)
+
+	// Verify nothing was added
+	if stack.stack.Len() != initialLen {
+		t.Error("Expected Push to closed stack to be ignored")
 	}
 }
 
-// Benchmark tests
-func BenchmarkStackPush(b *testing.B) {
+func TestStack_MultipleWorkersAutoClose(t *testing.T) {
 	stack := NewStack[int]()
 
-	// Start background pop operations to consume items
-	go func() {
-		for {
-			<-stack.Pop()
-		}
-	}()
+	// Push some items
+	for i := 0; i < 3; i++ {
+		stack.Push(i)
+	}
 
-	// Small delay to ensure pop operation is ready
-	time.Sleep(time.Millisecond)
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			stack.Push(i)
-			i++
+	// Pop all items but don't call Done yet
+	for i := 0; i < 3; i++ {
+		_, ok := stack.Pop()
+		if !ok {
+			t.Error("Expected Pop to return true")
 		}
-	})
+	}
+
+	// Stack should not be closed yet (activeWorkers > 0)
+	if stack.closed {
+		t.Error("Expected stack to not be closed while workers are active")
+	}
+
+	// Call Done for all but one worker
+	for i := 0; i < 2; i++ {
+		stack.Done()
+	}
+
+	// Stack should still not be closed
+	if stack.closed {
+		t.Error("Expected stack to not be closed while workers are still active")
+	}
+
+	// Call Done for the last worker
+	stack.Done()
+
+	// Now stack should be closed
+	if !stack.closed {
+		t.Error("Expected stack to be closed after all workers are done")
+	}
 }
 
-func BenchmarkStackPop(b *testing.B) {
+func TestStack_WaitForItemsMultipleConsumers(t *testing.T) {
 	stack := NewStack[int]()
 
-	// Start background push operations to provide items
-	go func() {
-		i := 0
-		for {
-			stack.Push(i)
-			i++
-		}
-	}()
+	const numConsumers = 5
+	results := make(chan int, numConsumers)
 
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			<-stack.Pop()
+	// Start multiple consumers that will block
+	for i := 0; i < numConsumers; i++ {
+		go func() {
+			item, ok := stack.Pop()
+			if ok {
+				results <- item
+			} else {
+				results <- -1 // Indicate failure
+			}
+		}()
+	}
+
+	// Give consumers time to start and block
+	time.Sleep(10 * time.Millisecond)
+
+	// Push items to unblock consumers
+	for i := 0; i < numConsumers; i++ {
+		stack.Push(i)
+	}
+
+	// Collect results
+	received := make([]int, 0, numConsumers)
+	for i := 0; i < numConsumers; i++ {
+		select {
+		case result := <-results:
+			if result == -1 {
+				t.Error("Consumer failed to get item")
+			} else {
+				received = append(received, result)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Consumer did not receive item in time")
 		}
-	})
+	}
+
+	if len(received) != numConsumers {
+		t.Errorf("Expected %d results, got %d", numConsumers, len(received))
+	}
 }
 
-// TestStackNoItemsDropped verifies that push operations don't drop items
-// when there are no waiters, and that all items can be retrieved later.
-func TestStackNoItemsDropped(t *testing.T) {
+func TestStack_ZeroValue(t *testing.T) {
 	stack := NewStack[string]()
 
-	// Push items when there are no waiters
-	stack.Push("first")
-	stack.Push("second")
-	stack.Push("third")
+	// Push empty string (zero value for string)
+	stack.Push("")
 
-	// Pop all items and verify they come in LIFO order
-	item1 := <-stack.Pop()
-	if item1 != "third" {
-		t.Errorf("Expected 'third', got '%s'", item1)
+	item, ok := stack.Pop()
+	if !ok {
+		t.Error("Expected Pop to return true")
 	}
-
-	item2 := <-stack.Pop()
-	if item2 != "second" {
-		t.Errorf("Expected 'second', got '%s'", item2)
-	}
-
-	item3 := <-stack.Pop()
-	if item3 != "first" {
-		t.Errorf("Expected 'first', got '%s'", item3)
-	}
-
-	// Verify stack is now empty
-	if !stack.IsEmpty() {
-		t.Errorf("Expected stack to be empty")
+	if item != "" {
+		t.Errorf("Expected empty string, got %q", item)
 	}
 }

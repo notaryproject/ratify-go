@@ -15,7 +15,10 @@ limitations under the License.
 
 package sync
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 // Slice is a thread-safe collector for items of type T.
 type Slice[T any] struct {
@@ -41,7 +44,5 @@ func (s *Slice[T]) Add(item T) {
 func (s *Slice[T]) Get() []T {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result := make([]T, len(s.items))
-	copy(result, s.items)
-	return result
+	return slices.Clone(s.items)
 }
