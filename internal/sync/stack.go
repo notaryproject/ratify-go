@@ -21,12 +21,11 @@ import (
 	"github.com/notaryproject/ratify-go/internal/stack"
 )
 
-// Stack represents a concurrency-safe stack implementation.
-// It wraps up a standard stack and provides additional synchronization 
-// primitives.
-// It makes accessing the underlying stack and activeWorkers as atomic.
-// Push operations are non-blocking and directly add items to the stack.
-// Pop operations are blocking and use sync.Cond to wait for items.
+// Stack is a thread-safe stack data structure that supports concurrent
+// operations.
+// It uses a mutex for synchronization and a condition variable for coordinating
+// blocking Pop operations. The stack tracks active workers to enable graceful
+// shutdown when all work is complete.
 type Stack[T any] struct {
 	mu            sync.Mutex
 	cond          *sync.Cond

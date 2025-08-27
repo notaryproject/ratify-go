@@ -184,7 +184,6 @@ func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo st
 			if err := sched.execute(func() error {
 				return e.verifySubjectAgainstReferrers(childCtx, task, repo, referenceTypes, evaluator, sem, stack)
 			}, stack.Done); err != nil {
-				// Handle synchronous execution error
 				firstErr.CompareAndSwap(nil, &err)
 				return
 			}
