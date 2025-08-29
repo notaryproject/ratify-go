@@ -15,11 +15,7 @@ limitations under the License.
 
 package sync
 
-import (
-	"sync"
-
-	"github.com/notaryproject/ratify-go/internal/stack"
-)
+import "sync"
 
 // Stack is a thread-safe stack data structure that supports concurrent
 // operations.
@@ -30,15 +26,13 @@ type Stack[T any] struct {
 	mu            sync.Mutex
 	cond          *sync.Cond
 	activeWorkers int
-	stack         *stack.Stack[T]
+	items         []T
 	closed        bool
 }
 
 // NewStack creates a new concurrency-safe stack.
 func NewStack[T any]() *Stack[T] {
-	s := &Stack[T]{
-		stack: &stack.Stack[T]{},
-	}
+	s := &Stack[T]{}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
@@ -51,7 +45,7 @@ func (s *Stack[T]) Push(item T) {
 	if s.closed {
 		return
 	}
-	s.stack.Push(item)
+	s.items = append(s.items, item)
 	s.cond.Signal()
 }
 
@@ -62,16 +56,18 @@ func (s *Stack[T]) Pop() (T, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for s.stack.Len() == 0 && !s.closed {
+	for len(s.items) == 0 && !s.closed {
 		s.cond.Wait()
 	}
 
-	if s.closed && s.stack.Len() == 0 {
+	if s.closed && len(s.items) == 0 {
 		var zero T
 		return zero, false
 	}
 	s.activeWorkers++
-	return s.stack.Pop(), true
+	item := s.items[len(s.items)-1]
+	s.items = s.items[:len(s.items)-1]
+	return item, true
 }
 
 // Done signals that an item has been processed and a worker is released.
@@ -81,7 +77,7 @@ func (s *Stack[T]) Done() {
 	defer s.mu.Unlock()
 
 	s.activeWorkers--
-	if s.activeWorkers == 0 && !s.closed && s.stack.Len() == 0 {
+	if s.activeWorkers == 0 && !s.closed && len(s.items) == 0 {
 		s.closed = true
 		s.cond.Broadcast()
 	}

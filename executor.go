@@ -421,8 +421,8 @@ func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int) e
 	if len(verifiers) == 0 {
 		return fmt.Errorf("at least one verifier must be configured")
 	}
-	if concurrency < 0 {
-		return fmt.Errorf("concurrency must be greater than or equal to 0, got %d", concurrency)
+	if concurrency <= 0 {
+		return fmt.Errorf("concurrency must be greater than 0, got %d", concurrency)
 	}
 	return nil
 }

@@ -39,15 +39,15 @@ func TestStack_Push(t *testing.T) {
 
 	// Test pushing to empty stack
 	stack.Push(1)
-	if stack.stack.Len() != 1 {
-		t.Errorf("Expected stack length to be 1, got %d", stack.stack.Len())
+	if len(stack.items) != 1 {
+		t.Errorf("Expected stack length to be 1, got %d", len(stack.items))
 	}
 
 	// Test pushing multiple items
 	stack.Push(2)
 	stack.Push(3)
-	if stack.stack.Len() != 3 {
-		t.Errorf("Expected stack length to be 3, got %d", stack.stack.Len())
+	if len(stack.items) != 3 {
+		t.Errorf("Expected stack length to be 3, got %d", len(stack.items))
 	}
 }
 
@@ -234,13 +234,13 @@ func TestStack_PushToClosedStack(t *testing.T) {
 	}
 	stack.Done()
 
-	initialLen := stack.stack.Len()
+	initialLen := len(stack.items)
 
 	// Try to push to closed stack
 	stack.Push(2)
 
 	// Verify nothing was added
-	if stack.stack.Len() != initialLen {
+	if len(stack.items) != initialLen {
 		t.Error("Expected Push to closed stack to be ignored")
 	}
 }

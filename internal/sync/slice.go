@@ -23,14 +23,12 @@ import (
 // Slice is a thread-safe collector for items of type T.
 type Slice[T any] struct {
 	items []T
-	mu    sync.Mutex
+	mu    sync.RWMutex
 }
 
 // NewSlice creates a new thread-safe slice collector.
 func NewSlice[T any]() *Slice[T] {
-	return &Slice[T]{
-		items: make([]T, 0),
-	}
+	return &Slice[T]{}
 }
 
 // Add adds an item to the slice in a thread-safe manner.
@@ -42,7 +40,7 @@ func (s *Slice[T]) Add(item T) {
 
 // Get returns a copy of all collected items in a thread-safe manner.
 func (s *Slice[T]) Get() []T {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return slices.Clone(s.items)
 }
