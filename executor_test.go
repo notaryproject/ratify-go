@@ -18,6 +18,7 @@ package ratify
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -85,7 +86,7 @@ func (m *mockVerifier) Verify(ctx context.Context, opts *VerifyOptions) (*Verifi
 	if result, ok := m.verifyResult[opts.ArtifactDescriptor.Digest.String()]; ok {
 		return result, nil
 	}
-	return &VerificationResult{}, nil
+	return nil, errors.New("verification result not found for digest: " + opts.ArtifactDescriptor.Digest.String())
 }
 
 // mockStore is a mock implementation of Store.
@@ -915,6 +916,7 @@ func TestValidateArtifact(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			executor, _ := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer)
+			executor.Concurrency = 1
 			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateArtifact() error = %v, wantErr %v", err, tt.wantErr)
@@ -1023,7 +1025,7 @@ func TestValidateExecutorSetup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateExecutorSetup(tt.store, tt.verifiers)
+			_, err := validateExecutorSetup(tt.store, tt.verifiers, 1)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateExecutorSetup() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -1229,5 +1231,299 @@ func TestValidateArtifact_SubjectPrunedWithPreviousVerifierReport(t *testing.T) 
 
 	if !sameValidationResult(got, want) {
 		t.Errorf("ValidateArtifact() got = %v, want %v", got, want)
+	}
+}
+
+func TestValidateArtifact_ConcurrentExecution(t *testing.T) {
+	tests := []struct {
+		name           string
+		concurrency    int
+		opts           ValidateArtifactOptions
+		store          Store
+		verifiers      []Verifier
+		policyEnforcer PolicyEnforcer
+		want           *ValidationResult
+		wantErr        bool
+	}{
+		{
+			name:        "Concurrent execution with 4 goroutines - multiple artifacts",
+			concurrency: 4,
+			opts: ValidateArtifactOptions{
+				Subject: testImage,
+			},
+			store: &mockStore{
+				tagToDesc: map[string]ocispec.Descriptor{
+					testImage: {
+						Digest: testDigest1,
+					},
+				},
+				digestToReferrers: map[string][]ocispec.Descriptor{
+					testArtifact1: {
+						{Digest: testDigest2},
+						{Digest: testDigest3},
+						{Digest: testDigest4},
+						{Digest: testDigest5},
+					},
+				},
+			},
+			verifiers: []Verifier{&mockVerifier{
+				verifiable: true,
+				verifyResult: map[string]*VerificationResult{
+					testDigest2: {Description: validMessage2},
+					testDigest3: {Description: validMessage3},
+					testDigest4: {Description: validMessage4},
+					testDigest5: {Description: validMessage5},
+				},
+			}},
+			policyEnforcer: &mockPolicyEnforcer{
+				evaluator: &mockEvaluator{},
+			},
+			want: &ValidationResult{
+				Succeeded: true,
+				ArtifactReports: []*ValidationReport{
+					{Results: []*VerificationResult{{Description: validMessage2}}},
+					{Results: []*VerificationResult{{Description: validMessage3}}},
+					{Results: []*VerificationResult{{Description: validMessage4}}},
+					{Results: []*VerificationResult{{Description: validMessage5}}},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:        "Concurrent execution with 4 goroutines - nested artifacts",
+			concurrency: 4,
+			opts: ValidateArtifactOptions{
+				Subject: testImage,
+			},
+			store: &mockStore{
+				tagToDesc: map[string]ocispec.Descriptor{
+					testImage: {
+						Digest: testDigest1,
+					},
+				},
+				digestToReferrers: map[string][]ocispec.Descriptor{
+					testArtifact1: {
+						{Digest: testDigest2},
+						{Digest: testDigest3},
+					},
+					testArtifact2: {
+						{Digest: testDigest4},
+					},
+					testArtifact3: {
+						{Digest: testDigest5},
+					},
+				},
+			},
+			verifiers: []Verifier{&mockVerifier{
+				verifiable: true,
+				verifyResult: map[string]*VerificationResult{
+					testDigest2: {Description: validMessage2},
+					testDigest3: {Description: validMessage3},
+					testDigest4: {Description: validMessage4},
+					testDigest5: {Description: validMessage5},
+				},
+			}},
+			policyEnforcer: &mockPolicyEnforcer{
+				evaluator: &mockEvaluator{},
+			},
+			want: &ValidationResult{
+				Succeeded: true,
+				ArtifactReports: []*ValidationReport{
+					{
+						Results: []*VerificationResult{{Description: validMessage2}},
+						ArtifactReports: []*ValidationReport{
+							{Results: []*VerificationResult{{Description: validMessage4}}},
+						},
+					},
+					{
+						Results: []*VerificationResult{{Description: validMessage3}},
+						ArtifactReports: []*ValidationReport{
+							{Results: []*VerificationResult{{Description: validMessage5}}},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:        "Concurrent execution with 4 goroutines - error in one goroutine",
+			concurrency: 4,
+			opts: ValidateArtifactOptions{
+				Subject: testImage,
+			},
+			store: &mockStore{
+				tagToDesc: map[string]ocispec.Descriptor{
+					testImage: {
+						Digest: testDigest1,
+					},
+				},
+				digestToReferrers: map[string][]ocispec.Descriptor{
+					testArtifact1: {
+						{Digest: testDigest2},
+						{Digest: testDigest3},
+						{Digest: testDigest4},
+						{Digest: testDigest5},
+					},
+				},
+			},
+			verifiers: []Verifier{&mockVerifier{
+				verifiable: true,
+				// Missing result for testDigest3 will cause an error
+				verifyResult: map[string]*VerificationResult{
+					testDigest2: {Description: validMessage2},
+					// testDigest4: {Description: validMessage4},
+					// testDigest5: {Description: validMessage5},
+				},
+			}},
+			policyEnforcer: &mockPolicyEnforcer{
+				evaluator: &mockEvaluator{},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name:        "Concurrent execution with 4 goroutines - evaluator add result error",
+			concurrency: 4,
+			opts: ValidateArtifactOptions{
+				Subject: testImage,
+			},
+			store: &mockStore{
+				tagToDesc: map[string]ocispec.Descriptor{
+					testImage: {
+						Digest: testDigest1,
+					},
+				},
+				digestToReferrers: map[string][]ocispec.Descriptor{
+					testArtifact1: {
+						{Digest: testDigest2},
+						{Digest: testDigest3},
+					},
+				},
+			},
+			verifiers: []Verifier{&mockVerifier{
+				verifiable: true,
+				verifyResult: map[string]*VerificationResult{
+					testDigest2: {Description: validMessage2},
+					testDigest3: {Description: validMessage3},
+				},
+			}},
+			policyEnforcer: &mockPolicyEnforcer{
+				evaluator: &mockEvaluator{
+					returnAddResultErr: true,
+				},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor, err := NewExecutor(tt.store, tt.verifiers, tt.policyEnforcer)
+			if err != nil {
+				t.Fatalf("Failed to create executor: %v", err)
+			}
+			executor.Concurrency = tt.concurrency
+
+			got, err := executor.ValidateArtifact(context.Background(), tt.opts)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateArtifact() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !sameValidationResult(got, tt.want) {
+				t.Errorf("ValidateArtifact() = %v, want %v", got, tt.want)
+			}
+
+			// Verify that the executor was configured with the correct concurrency
+			if executor.Concurrency != tt.concurrency {
+				t.Errorf("Expected MaxConcurrency = %d, got %d", tt.concurrency, executor.Concurrency)
+			}
+		})
+	}
+}
+
+func TestValidateArtifact_ConcurrentRaceConditions(t *testing.T) {
+	// This test specifically checks for race conditions by running the same
+	// validation multiple times concurrently
+	store := &mockStore{
+		tagToDesc: map[string]ocispec.Descriptor{
+			testImage: {
+				Digest: testDigest1,
+			},
+		},
+		digestToReferrers: map[string][]ocispec.Descriptor{
+			testArtifact1: {
+				{Digest: testDigest2},
+				{Digest: testDigest3},
+				{Digest: testDigest4},
+				{Digest: testDigest5},
+			},
+		},
+	}
+
+	verifiers := []Verifier{&mockVerifier{
+		verifiable: true,
+		verifyResult: map[string]*VerificationResult{
+			testDigest2: {Description: validMessage2},
+			testDigest3: {Description: validMessage3},
+			testDigest4: {Description: validMessage4},
+			testDigest5: {Description: validMessage5},
+		},
+	}}
+
+	policyEnforcer := &mockPolicyEnforcer{
+		evaluator: &mockEvaluator{},
+	}
+
+	executor, err := NewExecutor(store, verifiers, policyEnforcer)
+	if err != nil {
+		t.Fatalf("Failed to create executor: %v", err)
+	}
+	executor.Concurrency = 4 // Set a reasonable concurrency limit for the test
+
+	opts := ValidateArtifactOptions{
+		Subject: testImage,
+	}
+
+	// Run multiple validations concurrently to test for race conditions
+	const numConcurrentValidations = 10
+	var wg sync.WaitGroup
+	results := make([]*ValidationResult, numConcurrentValidations)
+	errors := make([]error, numConcurrentValidations)
+
+	for i := 0; i < numConcurrentValidations; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			result, err := executor.ValidateArtifact(context.Background(), opts)
+			results[index] = result
+			errors[index] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify all validations succeeded
+	for i := 0; i < numConcurrentValidations; i++ {
+		if errors[i] != nil {
+			t.Errorf("Validation %d failed with error: %v", i, errors[i])
+		}
+		if results[i] == nil {
+			t.Errorf("Validation %d returned nil result", i)
+			continue
+		}
+		if !results[i].Succeeded {
+			t.Errorf("Validation %d failed", i)
+		}
+		if len(results[i].ArtifactReports) != 4 {
+			t.Errorf("Validation %d returned %d reports, expected 4", i, len(results[i].ArtifactReports))
+		}
+	}
+
+	// Verify all results are consistent
+	for i := 1; i < numConcurrentValidations; i++ {
+		if !sameValidationResult(results[0], results[i]) {
+			t.Errorf("Results are inconsistent between validation 0 and %d", i)
+		}
 	}
 }
