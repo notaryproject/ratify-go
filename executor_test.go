@@ -1025,7 +1025,7 @@ func TestValidateExecutorSetup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateExecutorSetup(tt.store, tt.verifiers, 1)
+			_, err := validateExecutorSetup(tt.store, tt.verifiers, 1)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateExecutorSetup() error = %v, wantErr %v", err, tt.wantErr)
 			}

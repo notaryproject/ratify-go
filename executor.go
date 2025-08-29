@@ -85,7 +85,7 @@ type Executor struct {
 // NewExecutor creates a new executor with the given verifiers, store, and
 // policy enforcer.
 func NewExecutor(store Store, verifiers []Verifier, policyEnforcer PolicyEnforcer) (*Executor, error) {
-	if err := validateExecutorSetup(store, verifiers, defaultConcurrency); err != nil {
+	if _, err := validateExecutorSetup(store, verifiers, defaultConcurrency); err != nil {
 		return nil, err
 	}
 
@@ -99,11 +99,12 @@ func NewExecutor(store Store, verifiers []Verifier, policyEnforcer PolicyEnforce
 
 // ValidateArtifact returns the result of verifying an artifact.
 func (e *Executor) ValidateArtifact(ctx context.Context, opts ValidateArtifactOptions) (*ValidationResult, error) {
-	if err := validateExecutorSetup(e.Store, e.Verifiers, e.Concurrency); err != nil {
+	concurrency, err := validateExecutorSetup(e.Store, e.Verifiers, int64(e.Concurrency))
+	if err != nil {
 		return nil, err
 	}
 
-	aggregatedVerifierReports, evaluator, err := e.aggregateVerifierReports(ctx, opts)
+	aggregatedVerifierReports, evaluator, err := e.aggregateVerifierReports(ctx, opts, concurrency)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate and aggregate verifier reports: %w", err)
 	}
@@ -127,7 +128,7 @@ func (e *Executor) ValidateArtifact(ctx context.Context, opts ValidateArtifactOp
 }
 
 // aggregateVerifierReports generates and aggregates all verifier reports.
-func (e *Executor) aggregateVerifierReports(ctx context.Context, opts ValidateArtifactOptions) ([]*ValidationReport, Evaluator, error) {
+func (e *Executor) aggregateVerifierReports(ctx context.Context, opts ValidateArtifactOptions, concurrency int64) ([]*ValidationReport, Evaluator, error) {
 	// Only resolve the root subject reference.
 	ref, desc, err := e.resolveSubject(ctx, opts.Subject)
 	if err != nil {
@@ -150,18 +151,18 @@ func (e *Executor) aggregateVerifierReports(ctx context.Context, opts ValidateAr
 			Artifact: desc,
 		},
 	}
-	return e.processTasks(ctx, rootTask, repo, opts.ReferenceTypes, evaluator)
+	return e.processTasks(ctx, rootTask, repo, opts.ReferenceTypes, evaluator, concurrency)
 }
 
 // processTasks processes the tasks in the worker manager and returns the
 // aggregated reports and the evaluator.
-func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator) ([]*ValidationReport, Evaluator, error) {
+func (e *Executor) processTasks(ctx context.Context, task *executorTask, repo string, referenceTypes []string, evaluator Evaluator, concurrency int64) ([]*ValidationReport, Evaluator, error) {
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
-	sem := semaphore.NewWeighted(int64(e.Concurrency) - 1)
+	sem := semaphore.NewWeighted(concurrency - 1)
 	sched := newScheduler(sem, &wg, &firstErr, cancel)
 	stack := ratiSync.NewStack[*executorTask]()
 	stack.Push(task)
@@ -414,17 +415,17 @@ type executorTask struct {
 	mu sync.Mutex
 }
 
-func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int) error {
+func validateExecutorSetup(store Store, verifiers []Verifier, concurrency int64) (int64, error) {
 	if store == nil {
-		return fmt.Errorf("store must be configured")
+		return 0, fmt.Errorf("store must be configured")
 	}
 	if len(verifiers) == 0 {
-		return fmt.Errorf("at least one verifier must be configured")
+		return 0, fmt.Errorf("at least one verifier must be configured")
 	}
 	if concurrency <= 0 {
-		return fmt.Errorf("concurrency must be greater than 0, got %d", concurrency)
+		return defaultConcurrency, nil
 	}
-	return nil
+	return concurrency, nil
 }
 
 // scheduler handles the pattern of running functions either concurrently or
