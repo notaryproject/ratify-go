@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/notaryproject/ratify-go/internal/set"
 )
@@ -256,8 +257,15 @@ func (n *evaluationNode) verifiable(verifier string) bool {
 }
 
 // thresholdEvaluator represents the state of the threshold policy during
-// evaluation.
+// evaluation. It is safe for concurrent use: [Executor] invokes Pruned,
+// AddResult and Commit from multiple goroutines when a subject has several
+// referrers, and all of them read or mutate the shared indexes and the
+// evaluation graph.
 type thresholdEvaluator struct {
+	// mu guards subjectIndex, verifierIndex and every node reachable from
+	// evalGraph.
+	mu sync.Mutex
+
 	// evalGraph is the root node of the evaluation graph.
 	evalGraph *evaluationNode
 
@@ -277,6 +285,9 @@ func verifierIndexKey(subjectDigest, artifactDigest, verifier string) string {
 // Pruned checks if whether the verifier is required to verify the subject
 // against the artifact.
 func (e *thresholdEvaluator) Pruned(ctx context.Context, subjectDigest, artifactDigest, verifier string) (PrunedState, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if _, ok := e.verifierIndex[verifierIndexKey(subjectDigest, artifactDigest, verifier)]; ok {
 		return PrunedStateVerifierPruned, nil
 	}
@@ -317,8 +328,12 @@ func (e *thresholdEvaluator) AddResult(ctx context.Context, subjectDigest, artif
 		// Only add successful verification result to the evaluator.
 		return nil
 	}
+	verifierName := artifactResult.Verifier.Name()
 
-	nodes, err := e.createEvaluationNodes(subjectDigest, artifactDigest, artifactResult.Verifier.Name())
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	nodes, err := e.createEvaluationNodes(subjectDigest, artifactDigest, verifierName)
 	if err != nil {
 		return err
 	}
@@ -399,6 +414,9 @@ func (e *thresholdEvaluator) createVirtualEvaluationNode(rule *ThresholdPolicyRu
 // In multi goroutine mode, commited node cannot be refreshed as it may need
 // more verification results to make a decision.
 func (e *thresholdEvaluator) Commit(ctx context.Context, subjectDigest string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	for _, node := range e.subjectIndex[subjectDigest] {
 		node.commited = true
 		node.refreshDecision()
@@ -408,6 +426,9 @@ func (e *thresholdEvaluator) Commit(ctx context.Context, subjectDigest string) e
 
 // Evaluate makes the final decision based on aggregated evaluation graph.
 func (e *thresholdEvaluator) Evaluate(ctx context.Context) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// Refresh the decision for the root node.
 	e.evalGraph.refreshDecision()
 	return e.evalGraph.ruleDecision == thresholdPolicyDecisionAllow, nil
