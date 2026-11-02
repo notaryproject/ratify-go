@@ -257,13 +257,8 @@ func (n *evaluationNode) verifiable(verifier string) bool {
 }
 
 // thresholdEvaluator represents the state of the threshold policy during
-// evaluation. It is safe for concurrent use: [Executor] invokes Pruned,
-// AddResult and Commit from multiple goroutines when a subject has several
-// referrers, and all of them read or mutate the shared indexes and the
-// evaluation graph.
+// evaluation.
 type thresholdEvaluator struct {
-	// mu guards subjectIndex, verifierIndex and every node reachable from
-	// evalGraph.
 	mu sync.Mutex
 
 	// evalGraph is the root node of the evaluation graph.

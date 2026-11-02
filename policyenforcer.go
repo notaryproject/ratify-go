@@ -66,10 +66,6 @@ type ValidationReport struct {
 
 // Evaluator is an interface that defines methods to aggregate and evaluate
 // verification results generated for an artifact per validation request.
-//
-// Implementations must be safe for concurrent use: [Executor] calls Pruned,
-// AddResult and Commit from multiple goroutines when verifying referrers
-// concurrently (see [Executor.Concurrency]).
 type Evaluator interface {
 	// Pruned determines whether verification for a given subject-artifact pair
 	// should be skipped.
