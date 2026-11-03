@@ -18,9 +18,11 @@ package ratify
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -183,6 +185,66 @@ func (m *mockPolicyEnforcer) Evaluator(ctx context.Context, subjectDigest string
 		return nil, errors.New("error happened creating evaluator")
 	}
 	return m.evaluator, nil
+}
+
+func TestValidateArtifact_ConcurrentThresholdPolicy(t *testing.T) {
+	const referrerCount = 100
+	verifier := &mockVerifier{
+		name:         notationVerifier1,
+		verifiable:   true,
+		verifyResult: make(map[string]*VerificationResult),
+	}
+	var referrers []ocispec.Descriptor
+	for i := range referrerCount {
+		desc := ocispec.Descriptor{
+			Digest: digest.FromString(fmt.Sprintf("signature-%d", i)),
+		}
+		referrers = append(referrers, desc)
+		verifier.verifyResult[desc.Digest.String()] = &VerificationResult{Verifier: verifier}
+	}
+	store := &mockStore{
+		tagToDesc: map[string]ocispec.Descriptor{
+			testImage: {Digest: testDigest1},
+		},
+		digestToReferrers: map[string][]ocispec.Descriptor{
+			testArtifact1: referrers,
+		},
+	}
+	// Keep the policy unsatisfied so every referrer is processed before pruning.
+	enforcer, err := NewThresholdPolicyEnforcer(&ThresholdPolicyRule{
+		Rules: []*ThresholdPolicyRule{
+			{Verifier: notationVerifier1},
+			{Verifier: notationVerifier2},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, concurrency := range []int{1, 0, 8} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			executor := &Executor{
+				Store:          store,
+				Verifiers:      []Verifier{verifier},
+				PolicyEnforcer: enforcer,
+				Concurrency:    concurrency,
+			}
+			result, err := executor.ValidateArtifact(context.Background(), ValidateArtifactOptions{Subject: testImage})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Succeeded {
+				t.Error("validation succeeded with a required verifier missing")
+			}
+			if got := len(result.ArtifactReports); got != referrerCount {
+				t.Fatalf("got %d artifact reports, want %d", got, referrerCount)
+			}
+			for _, report := range result.ArtifactReports {
+				if len(report.Results) != 1 || report.Results[0].Err != nil {
+					t.Errorf("unexpected verification results: %+v", report.Results)
+				}
+			}
+		})
+	}
 }
 
 func TestValidateArtifact(t *testing.T) {

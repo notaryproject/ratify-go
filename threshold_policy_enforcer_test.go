@@ -18,8 +18,85 @@ package ratify
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 )
+
+func TestThresholdEvaluator_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	enforcer, err := NewThresholdPolicyEnforcer(&ThresholdPolicyRule{
+		Rules: []*ThresholdPolicyRule{
+			{Rules: []*ThresholdPolicyRule{
+				{Verifier: notationVerifier1, Rules: []*ThresholdPolicyRule{
+					{Verifier: sbomVerifier1},
+				}},
+			}},
+			{Verifier: notationVerifier2},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator, err := enforcer.Evaluator(ctx, imageDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const referrerCount = 100
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range referrerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			artifactDigest := fmt.Sprintf("notation-%d", i)
+			if _, err := evaluator.Pruned(ctx, imageDigest, artifactDigest, notationVerifier1); err != nil {
+				t.Error(err)
+			}
+			if err := evaluator.AddResult(ctx, imageDigest, artifactDigest, &VerificationResult{
+				Verifier: &mockVerifier{name: notationVerifier1},
+			}); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := evaluator.AddResult(ctx, artifactDigest, fmt.Sprintf("sbom-%d", i), &VerificationResult{
+				Verifier: &mockVerifier{name: sbomVerifier1},
+			}); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := evaluator.Commit(ctx, artifactDigest); err != nil {
+				t.Error(err)
+			}
+			if allowed, err := evaluator.Evaluate(ctx); err != nil || allowed {
+				t.Errorf("Evaluate() = %v, %v; want false, nil", allowed, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	state := evaluator.(*thresholdEvaluator)
+	if got := len(state.subjectIndex); got != 1+2*referrerCount {
+		t.Errorf("subject index has %d entries, want %d", got, 1+2*referrerCount)
+	}
+	if got := len(state.verifierIndex); got != 2*referrerCount {
+		t.Errorf("verifier index has %d entries, want %d", got, 2*referrerCount)
+	}
+	if err := evaluator.AddResult(ctx, imageDigest, notationDigest2, &VerificationResult{
+		Verifier: &mockVerifier{name: notationVerifier2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := evaluator.Commit(ctx, imageDigest); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := evaluator.Evaluate(ctx); err != nil || !allowed {
+		t.Errorf("Evaluate() = %v, %v; want true, nil", allowed, err)
+	}
+}
 
 const (
 	imageDigest       = "image-digest"
