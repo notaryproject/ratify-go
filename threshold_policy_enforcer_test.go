@@ -18,6 +18,8 @@ package ratify
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -233,6 +235,96 @@ func TestEvaluation_SingleSignature(t *testing.T) {
 	}
 	if decision != true {
 		t.Fatalf("expected decision true, got %v", decision)
+	}
+}
+
+// TestEvaluation_ConcurrentMultipleSignatures is a regression test for
+// https://github.com/notaryproject/ratify-go/issues/104. The executor calls
+// Pruned, AddResult and Commit from multiple goroutines when a subject has
+// several referrers, so the evaluator must be safe for concurrent use.
+func TestEvaluation_ConcurrentMultipleSignatures(t *testing.T) {
+	// The testing policy can be represented in yaml as:
+	// - rules:
+	//    - verifier: notation-verifier-1
+	policy := &ThresholdPolicyRule{
+		Rules: []*ThresholdPolicyRule{
+			{
+				Verifier: notationVerifier1,
+			},
+		},
+	}
+
+	// The image that will be tested against the policy carries many
+	// signatures:
+	// image-digest
+	// ├── signature-0
+	// ├── ...
+	// └── signature-(n-1)
+	const signatureCount = 100
+	enforcer, err := NewThresholdPolicyEnforcer(policy)
+	if err != nil {
+		t.Fatalf("unexpected error creating enforcer: %v", err)
+	}
+	ctx := context.Background()
+	evaluator, err := enforcer.Evaluator(ctx, imageDigest)
+	if err != nil {
+		t.Fatalf("unexpected error creating evaluator: %v", err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, signatureCount)
+	var wg sync.WaitGroup
+	for i := range signatureCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			signatureDigest := fmt.Sprintf("signature-%d", i)
+			if _, err := evaluator.Pruned(ctx, imageDigest, signatureDigest, notationVerifier1); err != nil {
+				errCh <- err
+				return
+			}
+			result := &VerificationResult{
+				Verifier: &mockVerifier{name: notationVerifier1},
+			}
+			if err := evaluator.AddResult(ctx, imageDigest, signatureDigest, result); err != nil {
+				errCh <- err
+				return
+			}
+			if err := evaluator.Commit(ctx, signatureDigest); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// No result may be lost to a racing write.
+	e := evaluator.(*thresholdEvaluator)
+	if got := len(e.verifierIndex); got != signatureCount {
+		t.Fatalf("expected %d verifier index entries, got %d", signatureCount, got)
+	}
+	var childCount int
+	for _, nodes := range e.evalGraph.childNodes {
+		childCount += len(nodes)
+	}
+	if childCount != signatureCount {
+		t.Fatalf("expected %d child nodes, got %d", signatureCount, childCount)
+	}
+
+	if err = evaluator.Commit(ctx, imageDigest); err != nil {
+		t.Fatalf("unexpected error committing: %v", err)
+	}
+	decision, err := evaluator.Evaluate(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error evaluating: %v", err)
+	}
+	if !decision {
+		t.Fatal("expected decision true, got false")
 	}
 }
 
