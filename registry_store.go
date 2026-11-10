@@ -173,7 +173,7 @@ func (s *RegistryStore) ListReferrers(ctx context.Context, ref string, artifactT
 		}
 	}
 
-	if s.allowCosignTag {
+	if s.allowCosignTag && (len(artifactTypes) == 0 || slices.Contains(artifactTypes, artifactTypeCosign)) {
 		if err := fetchCosignSignature(ctx, repo, desc, fn); err != nil {
 			return err
 		}
