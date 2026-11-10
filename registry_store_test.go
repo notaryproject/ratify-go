@@ -891,3 +891,91 @@ func TestRegistryStore_fetchCosignSignature(t *testing.T) {
 		}
 	})
 }
+
+func TestRegistryStore_ListReferrers_cosignTagFilter(t *testing.T) {
+	subject := []byte(`{"layers":[]}`)
+	subjectDesc := content.NewDescriptorFromBytes(ocispec.MediaTypeImageManifest, subject)
+
+	cosignSig := []byte(`{"critical":{"identity":{"docker-reference":"test"}}}`)
+	cosignDesc := content.NewDescriptorFromBytes("application/vnd.dev.cosign.simplesigning.v1+json", cosignSig)
+
+	sigTag := strings.ReplaceAll(subjectDesc.Digest.String(), ":", "-") + ".sig"
+	emptyIndex, err := json.Marshal(ocispec.Index{
+		MediaType: ocispec.MediaTypeImageIndex,
+		Manifests: []ocispec.Descriptor{},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal referrers index: %v", err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/test/manifests/"+sigTag:
+			w.Header().Set("Content-Type", cosignDesc.MediaType)
+			w.Header().Set("Docker-Content-Digest", cosignDesc.Digest.String())
+			w.Header().Set("Content-Length", strconv.Itoa(int(cosignDesc.Size)))
+			w.WriteHeader(http.StatusOK)
+		case strings.HasPrefix(r.URL.Path, "/v2/test/referrers/"):
+			w.Header().Set("Content-Type", ocispec.MediaTypeImageIndex)
+			w.WriteHeader(http.StatusOK)
+			if _, err := w.Write(emptyIndex); err != nil {
+				t.Errorf("failed to write referrers index: %v", err)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+
+	store := NewRegistryStore(RegistryStoreOptions{
+		PlainHTTP:      true,
+		AllowCosignTag: true,
+	})
+	ref := uri.Host + "/test@" + subjectDesc.Digest.String()
+
+	t.Run("cosign artifact type excluded by the filter", func(t *testing.T) {
+		var got []ocispec.Descriptor
+		artifactTypes := []string{"application/vnd.cncf.notary.signature"}
+		if err := store.ListReferrers(context.Background(), ref, artifactTypes, func(referrers []ocispec.Descriptor) error {
+			got = append(got, referrers...)
+			return nil
+		}); err != nil {
+			t.Fatalf("ListReferrers() error = %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ListReferrers() returned %d referrer(s) outside the requested artifact types %v, want 0", len(got), artifactTypes)
+		}
+	})
+
+	t.Run("cosign artifact type included in the filter", func(t *testing.T) {
+		var got []ocispec.Descriptor
+		artifactTypes := []string{artifactTypeCosign}
+		if err := store.ListReferrers(context.Background(), ref, artifactTypes, func(referrers []ocispec.Descriptor) error {
+			got = append(got, referrers...)
+			return nil
+		}); err != nil {
+			t.Fatalf("ListReferrers() error = %v", err)
+		}
+		if len(got) != 1 || got[0].ArtifactType != artifactTypeCosign {
+			t.Fatalf("ListReferrers() = %v, want one cosign referrer", got)
+		}
+	})
+
+	t.Run("empty filter means all artifact types", func(t *testing.T) {
+		var got []ocispec.Descriptor
+		if err := store.ListReferrers(context.Background(), ref, nil, func(referrers []ocispec.Descriptor) error {
+			got = append(got, referrers...)
+			return nil
+		}); err != nil {
+			t.Fatalf("ListReferrers() error = %v", err)
+		}
+		if len(got) != 1 || got[0].ArtifactType != artifactTypeCosign {
+			t.Fatalf("ListReferrers() = %v, want one cosign referrer", got)
+		}
+	})
+}
