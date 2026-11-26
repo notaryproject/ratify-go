@@ -9,6 +9,33 @@
 
 `ratify-go` provides core functionality for the ratify library.
 
+## Packages
+
+| Package | Description |
+|---|---|
+| [`ratify`](https://pkg.go.dev/github.com/notaryproject/ratify-go) | Core interfaces (`Verifier`, `Store`, `PolicyEnforcer`) and the `Executor`. |
+| [`plugin`](https://pkg.go.dev/github.com/notaryproject/ratify-go/plugin) | Compile-time plugin framework: a registry that maps plugin type names to factories, plus the shared `KeyProvider` interface. |
+| [`imageref`](https://pkg.go.dev/github.com/notaryproject/ratify-go/imageref) | Normalization of image references and scopes, following container runtime rules. |
+
+### Writing a plugin
+
+A plugin implements one of the core interfaces and registers a factory for it,
+usually from an `init` function of a dedicated `register` package:
+
+```go
+package register
+
+import "github.com/notaryproject/ratify-go/plugin"
+
+func init() {
+	plugin.RegisterVerifier("my-verifier", myverifier.Factory)
+}
+```
+
+An application enables the plugin with a blank import and creates instances
+from configuration through `plugin.Default`. The application passes the plugin
+parameters through as raw JSON; each factory owns its parameter schema.
+
 ## Versioning
 
 The `ratify-go` library follows [Semantic Versioning](https://semver.org/), where breaking changes are reserved for MAJOR releases, and MINOR and PATCH releases must be 100% backwards compatible.
